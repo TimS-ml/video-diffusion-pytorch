@@ -1,3 +1,25 @@
+"""Video Diffusion Models (Ho et al., 2022, https://arxiv.org/abs/2204.03458) in PyTorch.
+
+This is a standard DDPM whose denoiser has been swapped from a 2D U-Net to a space-time
+factorized 3D U-Net. Videos are 5D tensors of shape (b, c, f, h, w), where `f` is the
+frame axis.
+
+Two choices define the architecture:
+
+1. No convolution ever mixes frames. Every conv kernel is (1, k, k) and every
+   up/downsample is (1, 4, 4) / (1, 2, 2), so the frame axis is neither convolved over
+   nor resampled. The convolutional trunk is a per-frame image network.
+2. All temporal mixing happens in attention. `EinopsToAndFrom` folds the frame axis into
+   the sequence position of a plain attention block, so one `Attention` module serves as
+   spatial attention (sequence = h*w) or temporal attention (sequence = f) depending only
+   on how the tensor was reshaped on the way in.
+
+`GaussianDiffusion` is close to textbook image DDPM: cosine beta schedule, epsilon
+prediction, full T-step ancestral sampling, no DDIM path. Its video-specific parts are the
+'b c f h w' shape check, classifier-free guidance over a BERT sentence embedding, and
+Imagen-style dynamic thresholding.
+"""
+
 import math
 import copy
 import torch
@@ -32,16 +54,22 @@ def is_odd(n):
     return (n % 2) == 1
 
 def default(val, d):
+    """Return `val` if it is not None, else `d` (called first if `d` is a callable)."""
     if exists(val):
         return val
     return d() if callable(d) else d
 
 def cycle(dl):
+    """Repeat a DataLoader forever, so training can be driven by a step counter."""
     while True:
         for data in dl:
             yield data
 
 def num_to_groups(num, divisor):
+    """Split `num` into chunks of size `divisor` plus a remainder chunk.
+
+    Used at sampling time to break a requested number of samples into batches.
+    """
     groups = num // divisor
     remainder = num % divisor
     arr = [divisor] * groups
@@ -50,6 +78,11 @@ def num_to_groups(num, divisor):
     return arr
 
 def prob_mask_like(shape, prob, device):
+    """Bernoulli mask of the given shape, True with probability `prob`.
+
+    Drives both classifier-free guidance dropout (`null_cond_prob`) and the per-sample
+    choice of `focus_present_mask`.
+    """
     if prob == 1:
         return torch.ones(shape, device = device, dtype = torch.bool)
     elif prob == 0:
@@ -58,6 +91,7 @@ def prob_mask_like(shape, prob, device):
         return torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
 
 def is_list_str(x):
+    """True if `x` is a list/tuple of raw strings, i.e. captions that still need tokenizing."""
     if not isinstance(x, (list, tuple)):
         return False
     return all([type(el) == str for el in x])
@@ -65,6 +99,16 @@ def is_list_str(x):
 # relative positional bias
 
 class RelativePositionBias(nn.Module):
+    """T5-style relative position bias over the frame axis.
+
+    Learns one scalar per (bucket, head) and adds it to the attention logits, so temporal
+    attention can tell how far apart two frames are. Buckets grow logarithmically with
+    distance, so the same table covers short and long gaps.
+
+    The paper used a different temporal encoding; this substitution is noted in the repo
+    README. Spatial attention gets no bias at all.
+    """
+
     def __init__(
         self,
         heads = 8,
@@ -78,6 +122,12 @@ class RelativePositionBias(nn.Module):
 
     @staticmethod
     def _relative_position_bucket(relative_position, num_buckets = 32, max_distance = 128):
+        """Map signed integer frame distances to bucket ids.
+
+        Half the buckets go to each sign. Within a sign, the first `num_buckets // 4`
+        distances get an exact bucket each; larger distances are binned logarithmically up
+        to `max_distance` and saturate there.
+        """
         ret = 0
         n = -relative_position
 
@@ -97,6 +147,7 @@ class RelativePositionBias(nn.Module):
         return ret
 
     def forward(self, n, device):
+        """Return a (heads, n, n) additive bias for a sequence of `n` frames."""
         q_pos = torch.arange(n, dtype = torch.long, device = device)
         k_pos = torch.arange(n, dtype = torch.long, device = device)
         rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
@@ -107,21 +158,27 @@ class RelativePositionBias(nn.Module):
 # small helper modules
 
 class EMA():
+    """Exponential moving average of model weights. The EMA copy is what gets sampled."""
+
     def __init__(self, beta):
         super().__init__()
         self.beta = beta
 
     def update_model_average(self, ma_model, current_model):
+        """In-place EMA update of every parameter of `ma_model` toward `current_model`."""
         for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
             old_weight, up_weight = ma_params.data, current_params.data
             ma_params.data = self.update_average(old_weight, up_weight)
 
     def update_average(self, old, new):
+        """`beta * old + (1 - beta) * new`, or `new` when there is no previous value."""
         if old is None:
             return new
         return old * self.beta + (1 - self.beta) * new
 
 class Residual(nn.Module):
+    """Wrap a module so its output is added back to its input."""
+
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -130,6 +187,12 @@ class Residual(nn.Module):
         return self.fn(x, *args, **kwargs) + x
 
 class SinusoidalPosEmb(nn.Module):
+    """Transformer sinusoidal embedding of the diffusion timestep.
+
+    Takes (b,) timesteps to (b, dim). Unchanged from image DDPM; the frame axis plays no
+    part, since a whole clip shares one timestep.
+    """
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -144,12 +207,20 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 def Upsample(dim):
+    """2x spatial upsample. The (1, ...) leading kernel/stride leaves the frame axis alone."""
     return nn.ConvTranspose3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
 def Downsample(dim):
+    """2x spatial downsample. Frame count is identical at every level of the U-Net."""
     return nn.Conv3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
 class LayerNorm(nn.Module):
+    """Channel-wise LayerNorm for (b, c, f, h, w), with a learned scale and no bias.
+
+    Normalizes over channels only, so every (frame, pixel) position is normalized
+    independently of the rest of the clip.
+    """
+
     def __init__(self, dim, eps = 1e-5):
         super().__init__()
         self.eps = eps
@@ -161,6 +232,12 @@ class LayerNorm(nn.Module):
         return (x - mean) / (var + self.eps).sqrt() * self.gamma
 
 class RMSNorm(nn.Module):
+    """Channel-wise RMSNorm used inside `Block`.
+
+    Replaces the GroupNorm that earlier versions of this repo used, following
+    https://arxiv.org/abs/2312.02696.
+    """
+
     def __init__(self, dim):
         super().__init__()
         self.scale = dim ** 0.5
@@ -170,6 +247,8 @@ class RMSNorm(nn.Module):
         return F.normalize(x, dim = 1) * self.scale * self.gamma
 
 class PreNorm(nn.Module):
+    """Normalize before `fn`. Combined with `Residual` this gives pre-norm attention blocks."""
+
     def __init__(self, dim, fn):
         super().__init__()
         self.fn = fn
@@ -183,6 +262,12 @@ class PreNorm(nn.Module):
 
 
 class Block(nn.Module):
+    """Conv -> RMSNorm -> optional FiLM scale/shift -> SiLU.
+
+    The kernel is (1, 3, 3): spatial only. No convolution anywhere in this model crosses
+    the frame axis; temporal mixing is left entirely to the attention layers.
+    """
+
     def __init__(self, dim, dim_out):
         super().__init__()
         self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding = (0, 1, 1))
@@ -200,6 +285,14 @@ class Block(nn.Module):
         return self.act(x)
 
 class ResnetBlock(nn.Module):
+    """Two `Block`s plus a skip, conditioned by FiLM on the time embedding.
+
+    `time_emb` is the diffusion timestep embedding concatenated with the BERT sentence
+    embedding when text conditioning is on. The MLP turns it into a (scale, shift) pair
+    broadcast over (f, h, w), so conditioning enters the network as one global vector per
+    clip rather than through cross attention.
+    """
+
     def __init__(self, dim, dim_out, *, time_emb_dim = None):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -212,7 +305,7 @@ class ResnetBlock(nn.Module):
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None):
-
+        """x: (b, c, f, h, w), time_emb: (b, time_emb_dim) -> (b, dim_out, f, h, w)."""
         scale_shift = None
         if exists(self.mlp):
             assert exists(time_emb), 'time emb must be passed in'
@@ -226,6 +319,17 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 class SpatialLinearAttention(nn.Module):
+    """Linear attention inside each frame, applied independently across the frame axis.
+
+    Frames are folded into the batch ('b c f h w' -> '(b f) c h w'), so this layer never
+    mixes time. Attention is the linear variant: softmax is taken over the feature dim of
+    q and over the spatial dim of k, and k, v are contracted into a small (d, e) context
+    matrix before q is applied. Cost is O(h*w) instead of O((h*w)^2), which is what makes
+    attention affordable at the high-resolution stages of the U-Net.
+
+    The bottleneck uses ordinary quadratic attention instead; see `Unet3D.mid_spatial_attn`.
+    """
+
     def __init__(self, dim, heads = 4, dim_head = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -235,6 +339,7 @@ class SpatialLinearAttention(nn.Module):
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
+        """x: (b, c, f, h, w) -> (b, c, f, h, w)."""
         b, c, f, h, w = x.shape
         x = rearrange(x, 'b c f h w -> (b f) c h w')
 
@@ -255,6 +360,20 @@ class SpatialLinearAttention(nn.Module):
 # attention along space and time
 
 class EinopsToAndFrom(nn.Module):
+    """Rearrange into `to_einops`, run `fn`, rearrange back to `from_einops`.
+
+    This is the whole mechanism behind space-time factorization. The same `Attention`
+    module becomes:
+
+    - temporal attention when wrapped as 'b c f h w' -> 'b (h w) f c', where the sequence
+      length is f and pixels ride along as batch;
+    - spatial attention when wrapped as 'b c f h w' -> 'b f (h w) c', where the sequence
+      length is h*w and frames ride along as batch.
+
+    Axis sizes are captured from the input shape so the inverse rearrange can be applied
+    without the caller passing them in.
+    """
+
     def __init__(self, from_einops, to_einops, fn):
         super().__init__()
         self.from_einops = from_einops
@@ -270,6 +389,13 @@ class EinopsToAndFrom(nn.Module):
         return x
 
 class Attention(nn.Module):
+    """Plain multi-head softmax attention over the second-to-last axis.
+
+    Axis-agnostic by design - `EinopsToAndFrom` decides whether that axis means time or
+    space. Two extras are used only by the temporal instances: rotary embeddings on q/k,
+    and an additive `pos_bias` from `RelativePositionBias`.
+    """
+
     def __init__(
         self,
         dim,
@@ -292,6 +418,15 @@ class Attention(nn.Module):
         pos_bias = None,
         focus_present_mask = None
     ):
+        """x: (..., n, dim) -> (..., n, dim).
+
+        `focus_present_mask` marks batch samples whose attention should be arrested to the
+        present frame: each position attends only to itself, which collapses temporal
+        attention to an identity map and turns the model into a per-frame image model.
+        This is the repo author's guess at how the paper trained on images and video
+        jointly. When the whole batch is marked there is a fast path that skips the qk
+        product entirely and returns the value projection.
+        """
         n, device = x.shape[-2], x.device
 
         qkv = self.to_qkv(x).chunk(3, dim = -1)
@@ -351,6 +486,24 @@ class Attention(nn.Module):
 # model
 
 class Unet3D(nn.Module):
+    """Space-time factorized 3D U-Net, the denoiser eps_theta.
+
+    Each resolution stage runs: two `ResnetBlock`s -> spatial linear attention ->
+    temporal attention -> spatial downsample. Only the bottleneck uses full quadratic
+    spatial attention.
+
+    Against a 2D image U-Net the differences are:
+
+    - Convolutions are (1, 3, 3) and resampling is (1, 4, 4) / (1, 2, 2), so frame count is
+      constant through the whole network and no conv sees more than one frame.
+    - A temporal attention layer follows every stage, plus one immediately after the
+      initial conv (`init_temporal_attn`).
+    - Time is encoded twice inside temporal attention: a T5 relative position bias added
+      to the logits, and rotary embeddings applied to q/k.
+    - `forward_with_cond_scale` implements classifier-free guidance over the text
+      embedding, and `focus_present_mask` can arrest temporal attention per sample.
+    """
+
     def __init__(
         self,
         dim,
@@ -366,6 +519,16 @@ class Unet3D(nn.Module):
         use_sparse_linear_attn = True,
         block_type = 'resnet'
     ):
+        """
+        Args:
+            dim: base channel width; stage widths are `dim * dim_mults[i]`.
+            cond_dim: width of the external conditioning vector, or None for unconditional.
+            out_dim: output channels, defaults to `channels`.
+            use_bert_text_cond: set `cond_dim` to BERT's 768 automatically.
+            init_kernel_size: spatial kernel of the initial conv, must be odd.
+            use_sparse_linear_attn: insert `SpatialLinearAttention` at every stage.
+            block_type: kept for API compatibility, only 'resnet' is wired up.
+        """
         super().__init__()
         self.channels = channels
 
@@ -469,6 +632,11 @@ class Unet3D(nn.Module):
         cond_scale = 2.,
         **kwargs
     ):
+        """Classifier-free guidance: `null + (cond - null) * cond_scale`.
+
+        Runs the network twice, once with the real condition and once with the learned
+        null embedding. `cond_scale = 1` (or an unconditional model) skips the second pass.
+        """
         logits = self.forward(*args, null_cond_prob = 0., **kwargs)
         if cond_scale == 1 or not self.has_cond:
             return logits
@@ -485,6 +653,17 @@ class Unet3D(nn.Module):
         focus_present_mask = None,
         prob_focus_present = 0.  # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
     ):
+        """x: (b, c, f, h, w), time: (b,) -> (b, out_dim, f, h, w).
+
+        `null_cond_prob` randomly swaps the condition for `null_cond_emb` during training,
+        which is what teaches the network the unconditional branch that guidance needs.
+        `prob_focus_present` samples the per-sample `focus_present_mask` when the caller
+        does not supply one.
+
+        Note the extra global skip: the activation right after the initial conv and
+        `init_temporal_attn` is stashed in `r` and concatenated onto the U-Net output
+        before `final_conv`, on top of the usual per-stage skips.
+        """
         assert not (self.has_cond and not exists(cond)), 'cond must be passed in if cond_dim specified'
         batch, device = x.shape[0], x.device
 
@@ -537,6 +716,11 @@ class Unet3D(nn.Module):
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
+    """Gather per-sample schedule coefficients a[t] and reshape them for broadcasting.
+
+    `x_shape` has 5 dims here, so the result is (b, 1, 1, 1, 1): one scalar per clip,
+    shared by every frame and every pixel.
+    """
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
@@ -545,6 +729,8 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     """
     cosine schedule
     as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+
+    Identical to the image case - the noise schedule knows nothing about the frame axis.
     """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
@@ -554,6 +740,28 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     return torch.clip(betas, 0, 0.9999)
 
 class GaussianDiffusion(nn.Module):
+    """DDPM training objective and ancestral sampler, operating on (b, c, f, h, w) clips.
+
+    Almost nothing in here is video-specific. The schedule buffers, the closed-form
+    forward process, the posterior and the reverse loop are the same code you would write
+    for images; `extract` just broadcasts over two extra axes. There is no DDIM path, so
+    sampling always costs the full `timesteps` network evaluations.
+
+    What matters for video is what is *not* per-frame: a clip draws one timestep t and one
+    noise tensor, and the loss is taken over the whole clip at once, so the network has to
+    denoise frames jointly and cannot fall back on treating them independently.
+
+    Additions over textbook DDPM, both inside `p_mean_variance`: classifier-free guidance
+    on the text embedding, and Imagen-style dynamic thresholding.
+
+    Args:
+        denoise_fn: the `Unet3D`.
+        num_frames: clip length, enforced by the shape check in `forward`.
+        text_use_bert_cls: embed captions with BERT's [CLS] token instead of a token mean.
+        use_dynamic_thres: clamp predicted x0 to a per-sample quantile instead of +-1.
+        dynamic_thres_percentile: the quantile used when `use_dynamic_thres` is on.
+    """
+
     def __init__(
         self,
         denoise_fn,
@@ -623,18 +831,21 @@ class GaussianDiffusion(nn.Module):
         self.dynamic_thres_percentile = dynamic_thres_percentile
 
     def q_mean_variance(self, x_start, t):
+        """Moments of the forward marginal q(x_t | x_0)."""
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
         log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
     def predict_start_from_noise(self, x_t, t, noise):
+        """Invert the forward process: recover x0 from x_t and a predicted epsilon."""
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def q_posterior(self, x_start, x_t, t):
+        """Moments of the tractable posterior q(x_{t-1} | x_t, x_0)."""
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -644,6 +855,15 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool, cond = None, cond_scale = 1.):
+        """Moments of the reverse step p(x_{t-1} | x_t).
+
+        Predicts epsilon under classifier-free guidance, converts it to x0, clips x0, then
+        hands it to `q_posterior`. With `use_dynamic_thres` the clip threshold is the
+        `dynamic_thres_percentile` quantile of |x0| per sample (floored at 1.0) instead of
+        a fixed 1.0, and x0 is rescaled by it - dynamic thresholding from Imagen
+        (https://arxiv.org/abs/2205.11487), which keeps high guidance scales from washing
+        out saturated samples.
+        """
         x_recon = self.predict_start_from_noise(x, t=t, noise = self.denoise_fn.forward_with_cond_scale(x, t, cond = cond, cond_scale = cond_scale))
 
         if clip_denoised:
@@ -666,6 +886,7 @@ class GaussianDiffusion(nn.Module):
 
     @torch.inference_mode()
     def p_sample(self, x, t, cond = None, cond_scale = 1., clip_denoised = True):
+        """One reverse step: draw x_{t-1} ~ p(x_{t-1} | x_t). No noise is added at t = 0."""
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(x = x, t = t, clip_denoised = clip_denoised, cond = cond, cond_scale = cond_scale)
         noise = torch.randn_like(x)
@@ -675,6 +896,12 @@ class GaussianDiffusion(nn.Module):
 
     @torch.inference_mode()
     def p_sample_loop(self, shape, cond = None, cond_scale = 1.):
+        """Run the full T-step reverse chain from Gaussian noise to a clip in [0, 1].
+
+        Every step evaluates the U-Net twice when guidance is on, over the whole 5D tensor,
+        which is why video sampling is expensive: cost scales with `num_frames` on top of
+        the usual `timesteps` factor.
+        """
         device = self.betas.device
 
         b = shape[0]
@@ -687,6 +914,11 @@ class GaussianDiffusion(nn.Module):
 
     @torch.inference_mode()
     def sample(self, cond = None, cond_scale = 1., batch_size = 16):
+        """Sample clips of shape (batch, channels, num_frames, image_size, image_size).
+
+        Raw caption strings passed as `cond` are tokenized and BERT-embedded here; a
+        pre-computed tensor is used as is, and its leading dim overrides `batch_size`.
+        """
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -700,6 +932,7 @@ class GaussianDiffusion(nn.Module):
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
+        """Blend two clips by noising both to step t, mixing linearly, and denoising back."""
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
 
@@ -715,6 +948,11 @@ class GaussianDiffusion(nn.Module):
         return img
 
     def q_sample(self, x_start, t, noise = None):
+        """Forward diffusion in closed form: x_t = sqrt(a_bar_t) x0 + sqrt(1 - a_bar_t) eps.
+
+        The noise tensor is the full clip shape, so noise is i.i.d. per pixel *and* per
+        frame - the corruption process carries no temporal structure of its own.
+        """
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         return (
@@ -723,6 +961,11 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, cond = None, noise = None, **kwargs):
+        """Simple DDPM loss: regress the network output onto the sampled noise.
+
+        Defaults to L1 rather than the usual L2. Extra kwargs (`prob_focus_present`,
+        `focus_present_mask`) pass straight through to `Unet3D.forward`.
+        """
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -744,6 +987,11 @@ class GaussianDiffusion(nn.Module):
         return loss
 
     def forward(self, x, *args, **kwargs):
+        """x: (b, c, f, h, w) in [0, 1] -> scalar loss.
+
+        Validates the 5D shape against `channels` / `num_frames` / `image_size`, draws one
+        timestep per clip, and rescales pixels to [-1, 1].
+        """
         b, device, img_size, = x.shape[0], x.device, self.image_size
         check_shape(x, 'b c f h w', c = self.channels, f = self.num_frames, h = img_size, w = img_size)
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
@@ -759,6 +1007,7 @@ CHANNELS_TO_MODE = {
 }
 
 def seek_all_images(img, channels = 3):
+    """Yield every frame of an animated PIL image, converted to the mode for `channels`."""
     assert channels in CHANNELS_TO_MODE, f'channels {channels} invalid'
     mode = CHANNELS_TO_MODE[channels]
 
@@ -774,6 +1023,7 @@ def seek_all_images(img, channels = 3):
 # tensor of shape (channels, frames, height, width) -> gif
 
 def video_tensor_to_gif(tensor, path, duration = 120, loop = 0, optimize = True):
+    """Write a (channels, frames, height, width) tensor out as an animated gif."""
     images = map(T.ToPILImage(), tensor.unbind(dim = 1))
     first_img, *rest_imgs = images
     first_img.save(path, save_all = True, append_images = rest_imgs, duration = duration, loop = loop, optimize = optimize)
@@ -782,6 +1032,7 @@ def video_tensor_to_gif(tensor, path, duration = 120, loop = 0, optimize = True)
 # gif -> (channels, frame, height, width) tensor
 
 def gif_to_tensor(path, channels = 3, transform = T.ToTensor()):
+    """Read an animated gif into a (channels, frames, height, width) tensor."""
     img = Image.open(path)
     tensors = tuple(map(transform, seek_all_images(img, channels = channels)))
     return torch.stack(tensors, dim = 1)
@@ -790,12 +1041,18 @@ def identity(t, *args, **kwargs):
     return t
 
 def normalize_img(t):
+    """Map pixels from [0, 1] to the [-1, 1] range the diffusion process assumes."""
     return t * 2 - 1
 
 def unnormalize_img(t):
+    """Inverse of `normalize_img`."""
     return (t + 1) * 0.5
 
 def cast_num_frames(t, *, frames):
+    """Truncate or zero-pad a clip along the frame axis so every sample has `frames` frames.
+
+    Lets a folder of variable-length gifs be batched without any preprocessing pass.
+    """
     f = t.shape[1]
 
     if f == frames:
@@ -807,6 +1064,11 @@ def cast_num_frames(t, *, frames):
     return F.pad(t, (0, 0, 0, 0, 0, frames - f))
 
 class Dataset(data.Dataset):
+    """Folder of gif files, each decoded into a (channels, frames, height, width) clip.
+
+    Clips are resized, center cropped, and forced to `num_frames` by `cast_num_frames`.
+    """
+
     def __init__(
         self,
         folder,
@@ -843,6 +1105,12 @@ class Dataset(data.Dataset):
 # trainer class
 
 class Trainer(object):
+    """Training loop: gradient accumulation, AMP, EMA, periodic sampling and checkpoints.
+
+    Nothing here is video-specific beyond writing samples out as a grid of gifs instead of
+    a grid of images. Sampling always uses the EMA copy, never the live weights.
+    """
+
     def __init__(
         self,
         diffusion_model,
@@ -901,15 +1169,18 @@ class Trainer(object):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Hard-copy the live weights into the EMA model."""
         self.ema_model.load_state_dict(self.model.state_dict())
 
     def step_ema(self):
+        """Update the EMA model, or keep hard-copying while still under `step_start_ema`."""
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
         self.ema.update_model_average(self.ema_model, self.model)
 
     def save(self, milestone):
+        """Checkpoint the step counter, live weights, EMA weights and the AMP scaler."""
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
@@ -919,6 +1190,7 @@ class Trainer(object):
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone, **kwargs):
+        """Restore from a checkpoint. `milestone = -1` picks the highest-numbered one."""
         if milestone == -1:
             all_milestones = [int(p.stem.split('-')[-1]) for p in Path(self.results_folder).glob('**/*.pt')]
             assert len(all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
@@ -937,6 +1209,12 @@ class Trainer(object):
         focus_present_mask = None,
         log_fn = noop
     ):
+        """Run until `train_num_steps`, sampling a gif grid every `save_and_sample_every`.
+
+        `prob_focus_present` is forwarded down to `Unet3D`: it is the fraction of each
+        batch whose temporal attention is arrested to the present frame, this repo's take
+        on the paper's joint image and video training.
+        """
         assert callable(log_fn)
 
         while self.step < self.train_num_steps:

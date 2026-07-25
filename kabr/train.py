@@ -393,6 +393,14 @@ class Trainer:
                     "train_clips": self.n_train_clips, "fps": self.fps},
             dir=str(cfg.run_dir),
         )
+        # A resume restarts from the last checkpoint, which is up to ckpt_every steps
+        # behind wherever the crash happened. wandb's own step counter only moves
+        # forward, so logging those steps again with step= gets them dropped, and an eval
+        # or metric block that lands in the gap never reaches the dashboard even though
+        # its checkpoint is on disk. Plot against a step we control instead and let
+        # wandb's internal counter run free.
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
         self.diffusion.train()
         t_last = time.time()
 
@@ -418,7 +426,8 @@ class Trainer:
             if not math.isfinite(total):
                 raise RuntimeError(f"loss went non-finite at step {self.step}")
 
-            log = {"train/loss": total, "train/lr": lr,
+            log = {"train/global_step": self.step,
+                   "train/loss": total, "train/lr": lr,
                    "train/grad_norm": float(grad_norm),
                    "train/step_seconds": time.time() - t_last,
                    "train/clips_seen": self.step * cfg.batch_size * cfg.grad_accum,
@@ -437,7 +446,7 @@ class Trainer:
                 self.save(str(self.step))
             log.update(self.save_best(log))
 
-            wandb.log(log, step=self.step)
+            wandb.log(log)
             if self.step % 100 == 0:
                 print(f"step {self.step} loss {total:.4f} "
                       f"({log['train/step_seconds']*1000:.0f} ms)", flush=True)

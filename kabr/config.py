@@ -75,8 +75,17 @@ class Config:
     sample_every: int = 2_000
     sample_rows: int = 4
 
+    # A slower, better-looking inference than the one the metrics use, purely to watch the
+    # model with your own eyes. DDIM at 50 steps is a training-loop compromise; this shows
+    # what the same weights do when sampling is not the bottleneck.
+    preview_every: int = 10_000
+    preview_rows: int = 2
+    preview_timesteps: int = 250
+    preview_scale: int = 4  # 64 px is unwatchable at native size
+
     ckpt_every: int = 10_000
     ckpt_keep: int = 3
+    ckpt_milestone_every: int = 50_000  # these are never pruned
 
     # ---- bookkeeping ------------------------------------------------------
     run_name: str = ""

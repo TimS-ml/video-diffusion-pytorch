@@ -52,16 +52,21 @@ def lr_at(step: int, cfg: Config) -> float:
     return cfg.lr * (step + 1) / cfg.warmup_steps
 
 
-def write_gif(clip: torch.Tensor, path: Path, fps: int) -> Path:
+def write_gif(clip: torch.Tensor, path: Path, fps: int, scale: int = 1) -> Path:
     """(c, f, h, w) float in [0, 1] -> animated gif on disk.
 
     Encoding here rather than handing raw frames to wandb keeps moviepy out of the
     dependency set and leaves the gif on disk for inspection outside the dashboard.
+    `scale` upsamples with nearest neighbour, which keeps the pixel grid honest rather
+    than inventing detail the model did not produce.
     """
     from PIL import Image
 
     arr = (clip.clamp(0, 1) * 255).byte().permute(1, 2, 3, 0).cpu().numpy()
     frames = [Image.fromarray(a) for a in arr]
+    if scale > 1:
+        w, h = frames[0].size
+        frames = [f.resize((w * scale, h * scale), Image.NEAREST) for f in frames]
     path.parent.mkdir(parents=True, exist_ok=True)
     frames[0].save(path, save_all=True, append_images=frames[1:],
                    duration=int(1000 / fps), loop=0, optimize=False)
@@ -182,10 +187,13 @@ class Trainer:
 
     # ---------------------------------------------------------------- sampling
     @torch.no_grad()
-    def sample(self, n: int) -> torch.Tensor:
+    def sample(self, n: int, steps: int | None = None) -> torch.Tensor:
         """DDIM samples from the EMA weights, on cpu, in [0, 1]."""
         live = self.diffusion.denoise_fn
+        live_steps = self.diffusion.sampling_timesteps
         self.diffusion.denoise_fn = self.ema.ema_model
+        if steps is not None:
+            self.diffusion.sampling_timesteps = steps
         try:
             out = []
             done = 0
@@ -197,6 +205,7 @@ class Trainer:
             return torch.cat(out)
         finally:
             self.diffusion.denoise_fn = live
+            self.diffusion.sampling_timesteps = live_steps
 
     # ---------------------------------------------------------------- checkpoints
     def save(self, tag: str):
@@ -208,11 +217,23 @@ class Trainer:
             "opt": self.opt.state_dict(),
             "config": self.cfg.to_dict(),
         }, path)
-        keep = sorted(self.cfg.run_dir.glob("ckpt-[0-9]*.pt"),
-                      key=lambda p: int(p.stem.split("-")[-1]))
-        for old in keep[:-self.cfg.ckpt_keep]:
-            old.unlink()
+        self._prune_checkpoints()
         return path
+
+    def _prune_checkpoints(self):
+        """Keep the last `ckpt_keep`, plus every `ckpt_milestone_every` forever.
+
+        Milestones survive so a finished run can still be compared against its own earlier
+        weights, which a pure rolling window would have deleted.
+        """
+        numbered = sorted(self.cfg.run_dir.glob("ckpt-[0-9]*.pt"),
+                          key=lambda p: int(p.stem.split("-")[-1]))
+        recent = set(numbered[-self.cfg.ckpt_keep:])
+        for path in numbered:
+            step = int(path.stem.split("-")[-1])
+            if path in recent or step % self.cfg.ckpt_milestone_every == 0:
+                continue
+            path.unlink()
 
     def load(self, path):
         blob = torch.load(path, map_location=self.device, weights_only=False)
@@ -282,11 +303,44 @@ class Trainer:
         write_gif(grid_video(clips, self.cfg.sample_rows), path, self.fps)
         return {"samples/grid": wandb.Video(str(path), format="gif")}
 
+    def log_preview(self) -> dict:
+        """A slower, upscaled inference for eyeballing, separate from the metric samples."""
+        cfg = self.cfg
+        n = cfg.preview_rows ** 2
+        self.diffusion.eval()
+        t0 = time.time()
+        clips = self.sample(n, steps=cfg.preview_timesteps)
+        self.diffusion.train()
+
+        grid = self.media_dir / f"preview-{self.step:07d}-grid.gif"
+        write_gif(grid_video(clips, cfg.preview_rows), grid, self.fps, scale=cfg.preview_scale)
+        out = {
+            "preview/grid": wandb.Video(str(grid), format="gif",
+                                        caption=f"step {self.step}, DDIM {cfg.preview_timesteps}"),
+            "preview/seconds": time.time() - t0,
+        }
+        singles = []
+        for i in range(n):
+            path = self.media_dir / f"preview-{self.step:07d}-{i}.gif"
+            write_gif(clips[i], path, self.fps, scale=cfg.preview_scale)
+            singles.append(wandb.Video(str(path), format="gif"))
+        out["preview/clips"] = singles
+        return out
+
     # ---------------------------------------------------------------- loop
     def train(self):
         cfg = self.cfg
+        # Reuse the run id across restarts so a resumed run keeps one continuous set of
+        # curves; comparing checkpoints is the whole point of the metric block.
+        id_file = cfg.run_dir / "wandb_id.txt"
+        if id_file.exists():
+            run_id = id_file.read_text().strip()
+        else:
+            run_id = wandb.util.generate_id()
+            id_file.write_text(run_id)
         wandb.init(
             project=cfg.wandb_project, name=cfg.run_name, mode=cfg.wandb_mode,
+            id=run_id, resume="allow",
             config={**cfg.to_dict(), "params": self.params, "git_sha": git_sha(),
                     "train_clips": self.n_train_clips, "fps": self.fps},
             dir=str(cfg.run_dir),
@@ -327,6 +381,8 @@ class Trainer:
                 log.update(self.run_eval())
             if self.step % cfg.sample_every == 0:
                 log.update(self.log_samples())
+            if self.step % cfg.preview_every == 0:
+                log.update(self.log_preview())
             if self.step % cfg.metric_every == 0:
                 log.update(self.run_metrics())
             if self.step % cfg.ckpt_every == 0:

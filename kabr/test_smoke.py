@@ -96,7 +96,19 @@ def check_train(cfg):
     tr.train()
     ck = sorted(cfg.run_dir.glob("ckpt-*.pt"))
     assert ck, "no checkpoint written"
-    print(f"[ok] training loop ran {cfg.train_steps} steps, checkpoints: {[p.name for p in ck]}")
+    names = {p.name for p in ck}
+    # step 3 is neither one of the last `ckpt_keep` nor a milestone, so it must be gone;
+    # step 6 is a milestone and must survive
+    assert "ckpt-3.pt" not in names, names
+    assert "ckpt-6.pt" in names, names
+    print(f"[ok] training loop ran {cfg.train_steps} steps, checkpoints: {sorted(names)}")
+
+    previews = sorted(p.name for p in (cfg.run_dir / "media").glob("preview-*.gif"))
+    assert previews, "no preview gif written"
+    from PIL import Image
+    im = Image.open(cfg.run_dir / "media" / previews[0])
+    assert im.size[0] % cfg.preview_scale == 0 and im.size[0] > cfg.image_size
+    print(f"[ok] previews written: {previews}, first is {im.size} over {im.n_frames} frames")
 
     tr2 = Trainer(cfg)
     tr2.load(ck[-1])
@@ -114,8 +126,9 @@ if __name__ == "__main__":
         num_workers=0, compile_model=False,
         eval_every=3, eval_clips=4, eval_timesteps=2,
         sample_every=6, sample_rows=2,
+        preview_every=3, preview_rows=2, preview_timesteps=10, preview_scale=2,
         metric_every=6, metric_samples=16, metric_batch=8,
-        ckpt_every=6, wandb_mode="disabled",
+        ckpt_every=3, ckpt_keep=1, ckpt_milestone_every=6, wandb_mode="disabled",
         run_name="smoke",
     )
     cfg = Config(**base)

@@ -26,9 +26,17 @@ max_restarts="${KABR_MAX_RESTARTS:-100}"
 gpu_wait="${KABR_GPU_WAIT:-1800}"
 gpu_index="${KABR_GPU:-0}"
 log="${repo_root}/logs/supervise_${KABR_RUN_NAME}.log"
-mkdir -p "${repo_root}/logs"
+mkdir -p "${repo_root}/logs" "${run_dir}"
 
 say() { printf '[supervise %s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "${log}"; }
+
+# One supervisor per run. Two of them would fight over the GPU and, worse, interleave
+# writes into the same checkpoint filenames.
+exec 9>"${run_dir}/supervise.lock"
+if ! flock -n 9; then
+  say "another supervisor already holds ${run_dir}/supervise.lock, nothing to do"
+  exit 0
+fi
 
 newest_ckpt() {
   # Highest step wins; ls -t would pick whichever file the filesystem touched last, which

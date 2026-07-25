@@ -12,6 +12,8 @@
 #   KABR_RUN_NAME       run directory under $KABR_OUT_ROOT/runs to resume from
 #   KABR_MAX_RESTARTS   give up after this many restarts (default 100)
 #   KABR_GPU_WAIT       seconds to wait for the GPU to reappear (default 1800)
+#   KABR_PCI_RESET      PCI address to remove and rescan when the GPU vanishes, e.g.
+#                       0000:09:00.0. Needs passwordless sudo; ignored without it.
 #   KABR_GPU_NAME       substring the GPU at KABR_GPU must match, guarding against a
 #                       re-enumeration that shifts every index
 set -uo pipefail
@@ -57,6 +59,21 @@ gpu_present() {
   return 0
 }
 
+pci_reset() {
+  # A device that has fallen off the bus reads back as rev ff and no amount of waiting
+  # brings it back. Removing it and rescanning sometimes re-enumerates it without anyone
+  # walking over to replug the cable. Needs passwordless root, and is a no-op without it.
+  local bdf="${KABR_PCI_RESET:-}"
+  [[ -n "${bdf}" ]] || return 1
+  sudo -n true 2>/dev/null || { say "KABR_PCI_RESET set but sudo needs a password, skipping"; return 1; }
+
+  say "removing ${bdf} and rescanning the bus"
+  sudo -n sh -c "echo 1 > /sys/bus/pci/devices/${bdf}/remove" 2>/dev/null || true
+  sleep 5
+  sudo -n sh -c "echo 1 > /sys/bus/pci/rescan" 2>/dev/null || true
+  sleep 20
+}
+
 wait_for_gpu() {
   local waited=0
   while ! gpu_present; do
@@ -66,6 +83,11 @@ wait_for_gpu() {
       return 1
     fi
     (( waited == 0 )) && say "gpu ${gpu_index} is gone, waiting for it to come back"
+    # Retry the bus reset occasionally rather than every loop; hammering it while the
+    # link is down achieves nothing and fills the log.
+    if (( waited > 0 && waited % 300 == 0 )); then
+      pci_reset && continue
+    fi
     sleep 30
     waited=$(( waited + 30 ))
   done

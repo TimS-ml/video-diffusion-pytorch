@@ -27,8 +27,12 @@ echo "media     ${run}/media"
 [[ -f "${run}/wandb_id.txt" ]] && echo "wandb id  $(cat "${run}/wandb_id.txt")"
 
 echo
-echo "-- checkpoints --"
-ls -1sh "${run}"/ckpt-*.pt 2>/dev/null || echo "   none yet"
+echo "-- checkpoints (newest 5 of $(ls -1 "${run}"/ckpt-*.pt 2>/dev/null | wc -l)) --"
+ls -1sht "${run}"/ckpt-*.pt 2>/dev/null | head -5 || echo "   none yet"
+
+echo
+echo "-- best --"
+ls -1sh "${run}"/best-*.pt 2>/dev/null || echo "   none yet"
 
 echo
 echo "-- newest media --"

@@ -83,9 +83,16 @@ class Config:
     preview_timesteps: int = 250
     preview_scale: int = 4  # 64 px is unwatchable at native size
 
-    ckpt_every: int = 10_000
-    ckpt_keep: int = 3
+    # Sized for a machine that can lose power without warning: at ~0.3 s/step a 1k interval
+    # caps the loss from a hard crash at about five minutes.
+    ckpt_every: int = 1_000
+    ckpt_keep: int = 15
     ckpt_milestone_every: int = 50_000  # these are never pruned
+
+    # Metrics tracked into `best-<metric>.pt`, lower being better for all of them. `fvd/val`
+    # only moves on the metric_every grid but is the one worth trusting; the held-out loss
+    # updates every eval_every and mostly serves as an early warning that something broke.
+    best_metrics: tuple = ("fvd/val", "eval/val_eps_mse")
 
     # ---- bookkeeping ------------------------------------------------------
     run_name: str = ""

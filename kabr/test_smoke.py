@@ -110,9 +110,24 @@ def check_train(cfg):
     assert im.size[0] % cfg.preview_scale == 0 and im.size[0] > cfg.image_size
     print(f"[ok] previews written: {previews}, first is {im.size} over {im.n_frames} frames")
 
+    # every tracked metric was logged at least once, so every one of them must have a
+    # checkpoint, and the recorded value must be the lowest the run actually saw
+    assert tr.best, "no best metric was ever recorded"
+    for name, value in tr.best.items():
+        slug = name.replace("/", "_")
+        path = cfg.run_dir / f"best-{slug}.pt"
+        assert path.exists(), f"{name} has a record but no {path.name}"
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        assert blob["best_metric"]["name"] == name
+        assert blob["best_metric"]["value"] == value
+        assert blob["best_metric"]["step"] == blob["step"]
+    assert not list(cfg.run_dir.glob("*.pt.tmp")), "atomic save left a temporary file behind"
+    print(f"[ok] best checkpoints: { {k: round(v, 4) for k, v in tr.best.items()} }")
+
     tr2 = Trainer(cfg)
     tr2.load(ck[-1])
     assert tr2.step == tr.step
+    assert tr2.best == tr.best, "best record did not survive the resume"
     for (k1, v1), (k2, v2) in zip(tr.unet.state_dict().items(), tr2.unet.state_dict().items()):
         assert k1 == k2 and torch.equal(v1.cpu(), v2.cpu()), k1
     print("[ok] checkpoint round-trips")

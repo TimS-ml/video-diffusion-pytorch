@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -167,6 +168,12 @@ class Trainer:
         self.frame_metrics = None
         self.ref = {}
         self.step = 0
+        self.best: dict[str, float] = {}
+
+        # A crash during a write leaves one of these behind; it is never the file anything
+        # reads from, but there is no reason to keep half a gigabyte of it around.
+        for stale in cfg.run_dir.glob("*.pt.tmp"):
+            stale.unlink()
 
         self.params = sum(p.numel() for p in self.unet.parameters())
         print(f"unet {self.params/1e6:.1f}M params | {self.n_train_clips} train mini-scenes "
@@ -208,17 +215,52 @@ class Trainer:
             self.diffusion.sampling_timesteps = live_steps
 
     # ---------------------------------------------------------------- checkpoints
-    def save(self, tag: str):
-        path = self.cfg.run_dir / f"ckpt-{tag}.pt"
-        torch.save({
+    def _blob(self) -> dict:
+        return {
             "step": self.step,
             "unet": self.unet.state_dict(),
             "ema": self.ema.state_dict(),
             "opt": self.opt.state_dict(),
             "config": self.cfg.to_dict(),
-        }, path)
+            "best": self.best,
+        }
+
+    @staticmethod
+    def _atomic_save(blob: dict, path):
+        """Write via a temporary file so losing power mid-write cannot leave a corrupt
+        checkpoint sitting where the newest good one should be."""
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            torch.save(blob, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
+    def save(self, tag: str):
+        path = self.cfg.run_dir / f"ckpt-{tag}.pt"
+        self._atomic_save(self._blob(), path)
         self._prune_checkpoints()
         return path
+
+    def save_best(self, log: dict) -> dict:
+        """Promote the current weights to `best-<metric>.pt` for every tracked metric that
+        just reached a new low. Returns the wandb entries recording those lows."""
+        out = {}
+        for name in self.cfg.best_metrics:
+            value = log.get(name)
+            if value is None or not math.isfinite(value):
+                continue
+            if value >= self.best.get(name, math.inf):
+                continue
+            self.best[name] = value
+            slug = name.replace("/", "_")
+            blob = self._blob()
+            blob["best_metric"] = {"name": name, "value": value, "step": self.step}
+            self._atomic_save(blob, self.cfg.run_dir / f"best-{slug}.pt")
+            out[f"best/{slug}"] = value
+            out[f"best/{slug}_step"] = self.step
+            print(f"  new best {name} = {value:.4f} at step {self.step}", flush=True)
+        return out
 
     def _prune_checkpoints(self):
         """Keep the last `ckpt_keep`, plus every `ckpt_milestone_every` forever.
@@ -241,7 +283,13 @@ class Trainer:
         self.ema.load_state_dict(blob["ema"])
         self.opt.load_state_dict(blob["opt"])
         self.step = blob["step"]
+        # Carry the record over, otherwise the first eval after a resume always looks like a
+        # new best and overwrites a genuinely better checkpoint.
+        self.best = dict(blob.get("best") or {})
         print(f"resumed from {path} at step {self.step}")
+        if self.best:
+            record = ", ".join(f"{k}={v:.4f}" for k, v in self.best.items())
+            print(f"  carrying best so far: {record}")
 
     # ---------------------------------------------------------------- eval blocks
     def run_eval(self) -> dict:
@@ -387,6 +435,7 @@ class Trainer:
                 log.update(self.run_metrics())
             if self.step % cfg.ckpt_every == 0:
                 self.save(str(self.step))
+            log.update(self.save_best(log))
 
             wandb.log(log, step=self.step)
             if self.step % 100 == 0:

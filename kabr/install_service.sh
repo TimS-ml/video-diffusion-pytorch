@@ -40,6 +40,10 @@ mkdir -p "${conf_dir}" "${unit_dir}"
   echo "KABR_GPU=${KABR_GPU:-0}"
   echo "KABR_GPU_NAME=${KABR_GPU_NAME:-}"
   echo "KABR_GPU_WAIT=${KABR_GPU_WAIT:-86400}"
+  # Both of these are easy to set for a shell you launched by hand and then lose on the
+  # next boot, which is exactly when unattended recovery has to work.
+  echo "KABR_PCI_RESET=${KABR_PCI_RESET:-}"
+  echo "KABR_POWER_LIMIT=${KABR_POWER_LIMIT:-}"
   # The supervisor execs `python`, so the environment it needs has to be on PATH already;
   # a login shell started by systemd will not have run conda activate.
   echo "PATH=$(dirname "$(command -v python)"):/usr/local/bin:/usr/bin:/bin"
@@ -74,4 +78,8 @@ echo "  watch    journalctl --user -u kabr-train -f"
 if ! loginctl show-user "${USER}" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
   echo "note: lingering is off, so this starts at login rather than at boot"
   echo "      sudo loginctl enable-linger ${USER}"
+fi
+if [[ -n "${KABR_PCI_RESET:-}${KABR_POWER_LIMIT:-}" ]] && ! sudo -n true 2>/dev/null; then
+  echo "note: bus reset and the power cap both need a sudoers rule to work unattended"
+  echo "      ./kabr/print_sudoers.sh | sudo tee /etc/sudoers.d/kabr-gpu"
 fi

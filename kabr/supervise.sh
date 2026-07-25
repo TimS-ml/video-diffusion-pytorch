@@ -14,8 +14,13 @@
 #   KABR_GPU_WAIT       seconds to wait for the GPU to reappear (default 1800)
 #   KABR_PCI_RESET      PCI address to remove and rescan when the GPU vanishes, e.g.
 #                       0000:09:00.0. Needs passwordless sudo; ignored without it.
+#   KABR_POWER_LIMIT    watts to cap the GPU at every time it appears. A replug or a bus
+#                       rescan resets the cap to the board default, so it has to be
+#                       reapplied rather than set once by hand. Needs the same sudo rule.
 #   KABR_GPU_NAME       substring the GPU at KABR_GPU must match, guarding against a
 #                       re-enumeration that shifts every index
+#
+# See kabr/print_sudoers.sh for the two commands the last three of those need.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -59,19 +64,45 @@ gpu_present() {
   return 0
 }
 
+have_passwordless_sudo() {
+  sudo -n true 2>/dev/null
+}
+
 pci_reset() {
   # A device that has fallen off the bus reads back as rev ff and no amount of waiting
   # brings it back. Removing it and rescanning sometimes re-enumerates it without anyone
   # walking over to replug the cable. Needs passwordless root, and is a no-op without it.
   local bdf="${KABR_PCI_RESET:-}"
   [[ -n "${bdf}" ]] || return 1
-  sudo -n true 2>/dev/null || { say "KABR_PCI_RESET set but sudo needs a password, skipping"; return 1; }
+  if ! have_passwordless_sudo; then
+    say "KABR_PCI_RESET is set but sudo wants a password - see kabr/print_sudoers.sh"
+    return 1
+  fi
 
+  # tee rather than `sh -c "echo > ..."`, because a sudoers rule for `sh -c` grants
+  # everything, while one for tee grants exactly these two writes.
   say "removing ${bdf} and rescanning the bus"
-  sudo -n sh -c "echo 1 > /sys/bus/pci/devices/${bdf}/remove" 2>/dev/null || true
+  echo 1 | sudo -n tee "/sys/bus/pci/devices/${bdf}/remove" >/dev/null 2>&1 || true
   sleep 5
-  sudo -n sh -c "echo 1 > /sys/bus/pci/rescan" 2>/dev/null || true
+  echo 1 | sudo -n tee /sys/bus/pci/rescan >/dev/null 2>&1 || true
   sleep 20
+}
+
+apply_power_limit() {
+  # The cap does not survive the card going away, so it gets reapplied on every
+  # appearance instead of being set once by hand. Capping costs a little throughput and
+  # buys headroom on a link that keeps dropping under full load.
+  local watts="${KABR_POWER_LIMIT:-}"
+  [[ -n "${watts}" ]] || return 0
+  if ! have_passwordless_sudo; then
+    say "KABR_POWER_LIMIT is set but sudo wants a password - see kabr/print_sudoers.sh"
+    return 0
+  fi
+  if sudo -n nvidia-smi -i "${gpu_index}" -pl "${watts}" >/dev/null 2>&1; then
+    say "capped gpu ${gpu_index} at ${watts}W"
+  else
+    say "could not cap gpu ${gpu_index} at ${watts}W, carrying on at the board default"
+  fi
 }
 
 wait_for_gpu() {
@@ -99,6 +130,7 @@ restarts=0
 fast_failures=0
 while :; do
   wait_for_gpu || exit 1
+  apply_power_limit
 
   ckpt="$(newest_ckpt)"
   args=("$@")

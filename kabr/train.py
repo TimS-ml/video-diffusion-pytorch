@@ -442,9 +442,14 @@ class Trainer:
                 log.update(self.log_preview())
             if self.step % cfg.metric_every == 0:
                 log.update(self.run_metrics())
+            # Before save, not after: the checkpoint carries the record of the best metrics
+            # seen so far, and a resume reloads it. Saving first writes a checkpoint that
+            # has not been told about this step's own eval, so a crash shortly after leaves
+            # the next run comparing against a stale record and calling a worse result a
+            # new best.
+            log.update(self.save_best(log))
             if self.step % cfg.ckpt_every == 0:
                 self.save(str(self.step))
-            log.update(self.save_best(log))
 
             wandb.log(log)
             if self.step % 100 == 0:

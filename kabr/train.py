@@ -48,9 +48,19 @@ def git_sha() -> str:
 
 
 def lr_at(step: int, cfg: Config) -> float:
-    if step >= cfg.warmup_steps:
+    if step < cfg.warmup_steps:
+        return cfg.lr * (step + 1) / cfg.warmup_steps
+    if cfg.lr_schedule == "constant":
         return cfg.lr
-    return cfg.lr * (step + 1) / cfg.warmup_steps
+    if cfg.lr_schedule != "cosine":
+        raise SystemExit(f"unknown lr_schedule {cfg.lr_schedule!r}, expected cosine or constant")
+    # Cosine from lr down to lr * lr_final_ratio across the post-warmup steps. Past the end
+    # of the schedule the floor holds, so overrunning train_steps cannot send the rate back
+    # up the curve.
+    span = max(1, cfg.train_steps - cfg.warmup_steps)
+    progress = min(1.0, (step - cfg.warmup_steps) / span)
+    floor = cfg.lr * cfg.lr_final_ratio
+    return floor + (cfg.lr - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def write_gif(clip: torch.Tensor, path: Path, fps: int, scale: int = 1) -> Path:

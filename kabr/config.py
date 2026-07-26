@@ -45,6 +45,12 @@ class Config:
     lr: float = 1e-4
     adam_betas: tuple[float, float] = (0.9, 0.99)
     warmup_steps: int = 1000
+    # Holding the peak rate for the whole run cost the first attempt its best weights: fvd
+    # bottomed out at step 60k and then climbed for the next 80k with nothing in the
+    # schedule to settle it. Decay is the default now, and "constant" reproduces the old
+    # behaviour for anyone rerunning that config.
+    lr_schedule: str = "cosine"  # cosine | constant
+    lr_final_ratio: float = 0.05  # cosine floor, as a fraction of lr
     max_grad_norm: float = 1.0
     train_steps: int = 300_000
     seed: int = 0

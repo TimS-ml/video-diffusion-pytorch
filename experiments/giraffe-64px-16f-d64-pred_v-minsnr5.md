@@ -109,7 +109,17 @@ batch 2 下第二次测直接 OOM,只有 batch 1 稳,而 batch 1 只用 11.56 Gi
 `giraffe-96px-16f-d64-pred_v-minsnr5`,wandb `ujg8ixld`。
 
 96px / dim 64 / bs 4 x accum 2 / `metric_batch` 8 / cosine decay 到 5% / 80,000 步。
-实测 630ms/step,显存 17.5G,约 14 小时。
+实测 630ms/step (probe 预估 841ms,实际更快),显存 17.5G,metric block 之后 18.0G。
+80k 步约 14 小时,加 8 轮 metric block 约 16.5 小时。
+
+启动后确认过的几件事: LR 在 1000 步到峰值 1e-4,5000 步 9.94e-5,10000 步 9.70e-5,
+cosine 在走;10,000 步的 metric block 在 `metric_batch` 8 下没有 OOM,采样峰值落在训练
+已占住的 pool 里,这是把它从 16 降到 8 的唯一目的。
+
+10,000 步第一组 metric: fvd/val 814.11 / kvd 62.01 / fid_frame 299.89 /
+novelty 0.872 / diversity 0.087 / motion 0.412。同样步数下 64px 是 547 / 32.1 / 245 /
+0.862 / 0.095 / 0.460。96px 在相同步数上更差是预期的,像素多了 2.25 倍,同样步数下模型
+见过的信息更少,而 FVD 和 FID 本身对分辨率敏感。这两组数不构成比较,只是记录起点。
 
 选 96px 不选 128px,是因为 128px 在这张卡上只有 batch 1 能稳定跑,吞吐掉到 1/6,一个
 等效长度的 run 要 39 小时,而且显存反而用得比 96px 少。选 dim 64 不加宽,是因为

@@ -151,11 +151,14 @@ while :; do
     exit 0
   fi
 
-  # A run that dies before it has trained anything is almost never the hardware.
-  if (( ran < 120 )); then
+  # A run that dies before it has trained anything is usually a bug rather than the
+  # hardware, but only if the hardware is still there to blame. A card that has fallen off
+  # the bus takes the run down in seconds too, and counting that as a bug retires the
+  # supervisor exactly when it is doing its job.
+  if (( ran < 120 )) && gpu_present; then
     fast_failures=$(( fast_failures + 1 ))
     if (( fast_failures >= 3 )); then
-      say "exit ${code} after only ${ran}s, three times running - this looks like a bug, stopping"
+      say "exit ${code} after only ${ran}s with the gpu still present, three times running - this looks like a bug, stopping"
       exit 1
     fi
   else

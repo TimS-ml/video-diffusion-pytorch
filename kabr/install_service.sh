@@ -40,6 +40,9 @@ mkdir -p "${conf_dir}" "${unit_dir}"
   echo "KABR_GPU=${KABR_GPU:-0}"
   echo "KABR_GPU_NAME=${KABR_GPU_NAME:-}"
   echo "KABR_GPU_WAIT=${KABR_GPU_WAIT:-86400}"
+  # Set this to 0 to make a start a single attempt, which is what you want while you are
+  # working out whether a failure is the hardware or the code.
+  echo "KABR_MAX_RESTARTS=${KABR_MAX_RESTARTS:-100}"
   # Both of these are easy to set for a shell you launched by hand and then lose on the
   # next boot, which is exactly when unattended recovery has to work.
   echo "KABR_PCI_RESET=${KABR_PCI_RESET:-}"

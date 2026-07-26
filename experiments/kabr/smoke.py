@@ -1,6 +1,13 @@
 """End-to-end smoke test: data -> model -> train steps -> eval -> metrics -> ckpt.
 
 Runs a deliberately tiny configuration so every code path executes in a couple of minutes.
+
+    ./experiments/kabr/run.sh python -m kabr.smoke
+
+Deliberately not named test_*.py. It needs a prepared cache and a few GB of VRAM, so it is
+a script to run by hand rather than something pytest should collect; under the old name
+pytest collected zero tests from it and reported success, which read like a passing suite.
+Unit tests that do belong to pytest live in test_diffusion_ext.py.
 """
 
 import os

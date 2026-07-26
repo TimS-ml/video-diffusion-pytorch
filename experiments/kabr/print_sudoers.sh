@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Print the sudoers rule the supervisor needs to recover an external GPU on its own.
 #
-#   ./kabr/print_sudoers.sh | sudo tee /etc/sudoers.d/kabr-gpu
+#   ./experiments/kabr/print_sudoers.sh | sudo tee /etc/sudoers.d/kabr-gpu
 #   sudo chmod 0440 /etc/sudoers.d/kabr-gpu
 #
 # Two capabilities, no more: re-enumerate a PCI device that has fallen off the bus, and
@@ -18,7 +18,7 @@ nvidia_smi="$(command -v nvidia-smi || echo /usr/bin/nvidia-smi)"
 tee_bin="$(command -v tee || echo /usr/bin/tee)"
 
 cat <<RULE
-# Installed by kabr/print_sudoers.sh - lets the training supervisor recover a GPU that
+# Installed by experiments/kabr/print_sudoers.sh - lets the training supervisor recover a GPU that
 # drops off the bus, without granting a general root shell.
 #
 # The device path is a wildcard rather than one bus address because a card that

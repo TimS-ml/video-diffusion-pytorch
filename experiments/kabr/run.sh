@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Wrapper that pins the environment this repo needs, then execs whatever it is given.
 #
-#   ./kabr/run.sh python -m kabr.prepare_data
-#   ./kabr/run.sh python -m kabr.train --train-steps 300000
+#   ./experiments/kabr/run.sh python -m kabr.prepare_data
+#   ./experiments/kabr/run.sh python -m kabr.train --train-steps 300000
 #
 # Required in the environment (never hardcoded in the repo):
 #   KABR_DATA_ROOT  dataset root, the directory holding image/
@@ -11,7 +11,10 @@
 #   KABR_GPU        PCI bus index of the GPU to use (default 0)
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This package lives under experiments/, so `kabr` is importable from the experiments
+# directory while `video_diffusion_pytorch` is importable from the repository root.
+exp_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "${exp_root}/.." && pwd)"
 
 : "${KABR_DATA_ROOT:?set KABR_DATA_ROOT to the KABR dataset root}"
 : "${KABR_OUT_ROOT:?set KABR_OUT_ROOT to a writable output directory}"
@@ -30,7 +33,7 @@ export CUDA_VISIBLE_DEVICES="${KABR_GPU:-0}"
 # Activation memory here is fragmentation-prone; expandable segments buy real headroom.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-export PYTHONPATH="${repo_root}:${PYTHONPATH:-}"
+export PYTHONPATH="${repo_root}:${exp_root}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 
 cd "${repo_root}"

@@ -3,7 +3,7 @@
 #
 # Run it with the environment you would normally train in (conda env active, KABR_* set):
 #
-#   KABR_RUN_NAME=my-run ./kabr/install_service.sh --train-steps 300000
+#   KABR_RUN_NAME=my-run ./experiments/kabr/install_service.sh --train-steps 300000
 #
 # The unit and its environment file are written under $HOME, so no machine specific path
 # ever lands in the repository.
@@ -21,7 +21,7 @@
 #   sudo loginctl enable-linger "$USER"
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 : "${KABR_DATA_ROOT:?set KABR_DATA_ROOT}"
 : "${KABR_OUT_ROOT:?set KABR_OUT_ROOT}"
@@ -61,7 +61,7 @@ Description=KABR video diffusion training supervisor
 Type=simple
 EnvironmentFile=${conf_dir}/env
 WorkingDirectory=${repo_root}
-ExecStart=${repo_root}/kabr/supervise.sh $*
+ExecStart=${repo_root}/experiments/kabr/supervise.sh $*
 # The supervisor handles its own retries; systemd restarting it would only fight the
 # three-fast-failures guard that stops a real bug from looping forever.
 Restart=no
@@ -84,5 +84,5 @@ if ! loginctl show-user "${USER}" -p Linger 2>/dev/null | grep -q 'Linger=yes'; 
 fi
 if [[ -n "${KABR_PCI_RESET:-}${KABR_POWER_LIMIT:-}" ]] && ! sudo -n true 2>/dev/null; then
   echo "note: bus reset and the power cap both need a sudoers rule to work unattended"
-  echo "      ./kabr/print_sudoers.sh | sudo tee /etc/sudoers.d/kabr-gpu"
+  echo "      ./experiments/kabr/print_sudoers.sh | sudo tee /etc/sudoers.d/kabr-gpu"
 fi

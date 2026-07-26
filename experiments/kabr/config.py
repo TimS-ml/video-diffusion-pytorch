@@ -61,7 +61,6 @@ class Config:
 
     # ---- runtime ----------------------------------------------------------
     compile_model: bool = True
-    grad_checkpoint: bool = False
     num_workers: int = 4
 
     # ---- evaluation -------------------------------------------------------

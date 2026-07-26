@@ -80,7 +80,7 @@ blob 里的 best 仍是 330.38,save_best 之后 40100 步崩了。从 ckpt-40000
 
 ## 容量实测
 
-停机后在 4090 上重新测了一遍,`kabr/probe_capacity.py`,合成输入,16 帧,bf16 autocast,
+停机后在 4090 上重新测了一遍,`experiments/kabr/probe_capacity.py`,合成输入,16 帧,bf16 autocast,
 torch.compile 开启。
 
 | res | dim | bs x ga | params | s/step | 峰值 GiB | clips/s |

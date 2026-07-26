@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Wrapper that pins the environment this repo needs, then execs whatever it is given.
 #
-#   ./experiments/kabr/run.sh python -m kabr.prepare_data
-#   ./experiments/kabr/run.sh python -m kabr.train --train-steps 300000
+#   ./utils/run.sh python -m kabr.prepare_data
+#   ./utils/run.sh python -m kabr.train --train-steps 300000
 #
 # Required in the environment (never hardcoded in the repo):
 #   KABR_DATA_ROOT  dataset root, the directory holding image/
@@ -11,10 +11,10 @@
 #   KABR_GPU        PCI bus index of the GPU to use (default 0)
 set -euo pipefail
 
-# This package lives under experiments/, so `kabr` is importable from the experiments
-# directory while `video_diffusion_pytorch` is importable from the repository root.
-exp_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-repo_root="$(cd "${exp_root}/.." && pwd)"
+# Experiment packages live under experiments/, so `kabr` is importable from there while
+# `video_diffusion_pytorch` is importable from the repository root.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exp_root="${repo_root}/experiments"
 
 : "${KABR_DATA_ROOT:?set KABR_DATA_ROOT to the KABR dataset root}"
 : "${KABR_OUT_ROOT:?set KABR_OUT_ROOT to a writable output directory}"

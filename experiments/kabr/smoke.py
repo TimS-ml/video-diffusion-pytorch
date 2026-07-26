@@ -2,7 +2,7 @@
 
 Runs a deliberately tiny configuration so every code path executes in a couple of minutes.
 
-    ./experiments/kabr/run.sh python -m kabr.smoke
+    ./utils/run.sh python -m kabr.smoke
 
 Deliberately not named test_*.py. It needs a prepared cache and a few GB of VRAM, so it is
 a script to run by hand rather than something pytest should collect; under the old name

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Non-blocking snapshot of a training run: latest step, newest media, checkpoints, GPU.
 #
-#   KABR_OUT_ROOT=... ./experiments/kabr/status.sh [run-name]
+#   KABR_OUT_ROOT=... ./utils/status.sh [run-name]
 #
 # Defaults to the only run under $KABR_OUT_ROOT/runs if there is exactly one.
 set -euo pipefail

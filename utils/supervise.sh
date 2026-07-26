@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Keep a training run alive on hardware that drops off the bus mid-run.
 #
-#   ./experiments/kabr/supervise.sh --train-steps 300000
+#   ./utils/supervise.sh --train-steps 300000
 #
 # Relaunches from the newest checkpoint whenever training exits non-zero, waiting for the
 # GPU to come back first. Exits for good when training finishes cleanly, when the GPU stays
@@ -20,10 +20,10 @@
 #   KABR_GPU_NAME       substring the GPU at KABR_GPU must match, guarding against a
 #                       re-enumeration that shifts every index
 #
-# See experiments/kabr/print_sudoers.sh for the two commands the last three of those need.
+# See utils/print_sudoers.sh for the two commands the last three of those need.
 set -uo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 : "${KABR_OUT_ROOT:?set KABR_OUT_ROOT}"
@@ -75,7 +75,7 @@ pci_reset() {
   local bdf="${KABR_PCI_RESET:-}"
   [[ -n "${bdf}" ]] || return 1
   if ! have_passwordless_sudo; then
-    say "KABR_PCI_RESET is set but sudo wants a password - see experiments/kabr/print_sudoers.sh"
+    say "KABR_PCI_RESET is set but sudo wants a password - see utils/print_sudoers.sh"
     return 1
   fi
 
@@ -95,7 +95,7 @@ apply_power_limit() {
   local watts="${KABR_POWER_LIMIT:-}"
   [[ -n "${watts}" ]] || return 0
   if ! have_passwordless_sudo; then
-    say "KABR_POWER_LIMIT is set but sudo wants a password - see experiments/kabr/print_sudoers.sh"
+    say "KABR_POWER_LIMIT is set but sudo wants a password - see utils/print_sudoers.sh"
     return 0
   fi
   if sudo -n nvidia-smi -i "${gpu_index}" -pl "${watts}" >/dev/null 2>&1; then
@@ -142,7 +142,7 @@ while :; do
   fi
 
   started=${SECONDS}
-  ./experiments/kabr/run.sh python -m kabr.train "${args[@]}"
+  ./utils/run.sh python -m kabr.train "${args[@]}"
   code=$?
   ran=$(( SECONDS - started ))
 

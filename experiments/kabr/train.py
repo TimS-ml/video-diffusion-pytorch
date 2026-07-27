@@ -413,6 +413,8 @@ class Trainer:
         wandb.define_metric("*", step_metric="train/global_step")
         self.diffusion.train()
         t_last = time.time()
+        t_start = time.time()
+        stop_reason = "train_steps"
 
         while self.step < cfg.train_steps:
             lr = lr_at(self.step, cfg)
@@ -466,9 +468,24 @@ class Trainer:
                 print(f"step {self.step} loss {total:.4f} "
                       f"({log['train/step_seconds']*1000:.0f} ms)", flush=True)
 
-        self.save("final")
+            # Checked after the step is fully accounted for - checkpointed, evaluated and
+            # logged - so stopping here never costs the work already done.
+            if cfg.stop_at_step and self.step >= cfg.stop_at_step:
+                stop_reason = "stop_at_step"
+                break
+            if cfg.stop_after_seconds and time.time() - t_start >= cfg.stop_after_seconds:
+                stop_reason = "stop_after_seconds"
+                break
+
+        # "final" is reserved for a run that actually reached its horizon. A chunk that ran
+        # out of wall clock saves under its step number instead, so the next chunk resumes
+        # from it and nothing downstream mistakes a partial run for a finished one.
+        done = self.step >= cfg.train_steps
+        self.save("final" if done else str(self.step))
         wandb.finish()
-        print("training complete")
+        print(f"KABR_STATUS {json.dumps({'step': self.step, 'done': done, 'reason': stop_reason, 'train_steps': cfg.train_steps})}",
+              flush=True)
+        print("training complete" if done else f"chunk stopped ({stop_reason}) at step {self.step}")
 
 
 def main():

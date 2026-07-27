@@ -63,6 +63,14 @@ class Config:
     compile_model: bool = True
     num_workers: int = 4
 
+    # A rented GPU is billed by the hour and its scheduler kills the container at a fixed
+    # timeout, so a long run has to be cut into chunks that each stop on their own terms and
+    # leave a checkpoint behind for the next one. Neither knob touches the lr schedule:
+    # `train_steps` still sets the cosine horizon, these only say when this particular
+    # process stops walking it. Both default to off, so a local run is unaffected.
+    stop_after_seconds: float = 0.0
+    stop_at_step: int = 0
+
     # ---- evaluation -------------------------------------------------------
     # L1: cheap deterministic held-out loss
     eval_every: int = 500

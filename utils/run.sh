@@ -31,6 +31,9 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${KABR_GPU:-0}"
 
 # Activation memory here is fragmentation-prone; expandable segments buy real headroom.
+# torch 2.10 reads PYTORCH_ALLOC_CONF and only warns about the older CUDA-specific name,
+# so set both and stay correct on either side of that rename.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export PYTHONPATH="${repo_root}:${exp_root}:${PYTHONPATH:-}"

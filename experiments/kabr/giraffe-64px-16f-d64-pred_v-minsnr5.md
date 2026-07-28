@@ -1,31 +1,38 @@
 # giraffe-64px-16f-d64-pred_v-minsnr5
 
-第一个完整 baseline。wandb run `0kd6gghk`,跑到 142,200 步人工停止,目标本来是 300k。
+First complete baseline. wandb run `0kd6gghk`, stopped by hand at step 142,200 against an
+original target of 300,000.
 
-## 结论
+## Conclusion
 
-FVD 在 60,000 步触底 282.33,之后连续八万步单调退化到 350 附近。学习率 warmup 之后
-恒定 1e-4,没有任何 decay,所以这个退化不存在自行恢复的机制。这个 run 最好的权重是
-60k 步,不是最后一步。
+`fvd/val` bottomed out at 282.33 on step 60,000 and then degraded for the next eighty
+thousand steps, settling around 350. The learning rate was held at 1e-4 after warmup with
+no decay, so nothing in the schedule could have pulled it back. The usable weights from
+this run are the ones at step 60,000, not the ones at the end.
 
-单帧质量和视频质量在 60k 之后分道扬镳:`fid_frame` 一直在改善,110k 步拿到全程最好的
-68.55,同期 `fvd/val` 已经退到 306。`motion/ratio` 在 120k 越过 1.0,生成视频的帧间
-运动量开始超过真实视频。三条线合起来指向时序一致性退化,不是画质退化。
+Single-frame quality and video quality separate after 60,000. `fid_frame` keeps improving
+long after FVD turns, reaching its best value of 68.55 at step 110,000 while `fvd/val` had
+already fallen back to 306. Over the same stretch `motion/ratio` climbs past 1.0, meaning
+generated clips move more between frames than real ones do. Read together, the three
+curves say the model is losing temporal consistency while its individual frames continue
+to get better. The failure is in how frames relate to each other, not in how they look.
 
-## Run 配置
+## Configuration
 
-64x64 / 16 帧 / stride 4 (7.5 fps) / dim 64 / 35.7M 参数 / pred_v + min-SNR-5 /
-有效 batch 8 (bs 4 x accum 2) / lr 1e-4 恒定 / EMA 0.999。
+64x64, 16 frames, stride 4 (7.5 fps), dim 64, 35.7M parameters, pred_v with min-SNR-5,
+effective batch 8 (bs 4 x accum 2), constant lr 1e-4, EMA 0.999.
 
-训练数据 1304 个 train mini-scene。每个 mini-scene 90 帧,61 帧窗口下有 30 个起始
-位置,`__getitem__` 每次随机取一个,所以不同 epoch 看到的窗口不同。窗口总数约 39k,
-但内容多样性的上限还是那 1304 个场景。142k 步 x 有效 batch 8 = 1.14M 个 clip,
-相当于在 1304 个场景上过了 872 遍。
+Training data is 1,304 train mini-scenes. Each mini-scene is 90 frames, which leaves 30
+possible start positions under a 61-frame window, and `__getitem__` picks one at random,
+so different epochs see different windows. That puts the window count near 39,000 while
+the ceiling on content diversity stays at 1,304 scenes. 142k steps at effective batch 8
+is 1.14M clips, or about 872 passes over those 1,304 scenes.
 
-## 指标轨迹
+## Metric trajectory
 
-`fvd/val` 的真实数据参照: 220 (train 自身两半) / 326 (train vs val) / 4000 (噪声)。
-`fid_frame` 参照 60.7,`motion/ratio` 和 `diversity/gen` 的 1.0 和 0.294 是真实数据。
+Real-data reference points for `fvd/val`: 220 for train against itself split in half, 326
+for train against val, 4,000 for noise. `fid_frame` reference is 60.7. The 1.0 in
+`motion/ratio` and the 0.294 in `diversity/gen` are real data.
 
 | step | fvd/val | kvd/train | fid_frame | novelty | diversity | motion |
 |---|---|---|---|---|---|---|
@@ -44,46 +51,23 @@ FVD 在 60,000 步触底 282.33,之后连续八万步单调退化到 350 附近�
 | 130k | 346.48 | 23.73 | 73.91 | 1.240 | 0.268 | 1.018 |
 | 140k | 351.25 | 23.78 | 73.63 | 1.214 | 0.267 | 1.010 |
 
-110k 那次回落到 306 说明 FVD 的噪声带有 ±25,比我一开始按 40k-60k 三个点估的 ±10 宽。
-即便按 ±25 算,282 到 350 这个涨幅也在噪声之外,而且是四个 block 单调。
+The drop back to 306 at 110k puts the noise band on FVD at roughly plus or minus 25, wider
+than the plus or minus 10 I first estimated off the three points between 40k and 60k. Even
+at the wider band, the move from 282 to 350 sits outside it and runs monotonically across
+four consecutive blocks, so it is a real regression rather than scatter.
 
-`nn/novelty_ratio` 全程在涨,120k 之后稳定在 1.21-1.24。大于 1 表示生成样本离训练集比
-验证集离训练集还远,所以退化不是背样本导致的。`diversity/gen` 从 0.095 涨到 0.267 后
-走平,仍然只有真实数据 0.294 的 91%。
+`nn/novelty_ratio` rises across the whole run and holds at 1.21 to 1.24 after 120k. Values
+above 1 mean generated samples sit farther from the training set than held-out validation
+clips do, which rules out memorisation as the cause of the regression. `diversity/gen`
+climbs from 0.095 to 0.267 and then flattens, still only 91% of the 0.294 measured on real
+data.
 
-## 过程中修掉的三个 bug
+## Measured capacity
 
-**`KABR_PCI_RESET` 在 systemd 实例里是死代码** (b138c2e)。`install_service.sh` 不把这个
-变量写进 `~/.config/kabr/env`,所以唯一能在 eGPU 掉出总线后自动恢复的路径,在开机自启
-场景下根本不存在。是查 `/proc/<MainPID>/environ` 发现的,读脚本看不出来 —— 脚本里
-`pci_reset()` 写得好好的。同一个 commit 里加了 `KABR_POWER_LIMIT`,因为掉线一次功耗墙
-就回到板卡默认值,手动设的只管一次。
+Re-measured on the 4090 after the run stopped, using `experiments/kabr/probe_capacity.py`
+with synthetic inputs, 16 frames, bf16 autocast and `torch.compile` enabled.
 
-**resume 会丢 metric** (12aecd8)。resume 从最近 checkpoint 起跑,要重走最多 `ckpt_every`
-步,而这些 step 崩溃前那条命已经 log 过了。wandb 的 `step=` 不接受回退,这段全被丢掉,
-落在 gap 里的 eval 和 metric block 即使 checkpoint 在盘上,dashboard 上也没有。改成
-`define_metric` 自定义 x 轴,不再传 `step=`。
-
-**崩溃后会把更差的权重记成 new best** (56cafbf)。checkpoint 的 blob 里存了 `best` 字典
-就是为了让 resume 接着比,但训练循环里 `save()` 排在 `save_best()` 前面,写进 checkpoint
-的 `best` 还没被本步的 eval 更新过。40k 步 metric block 出 297.36,存 ckpt-40000 时
-blob 里的 best 仍是 330.38,save_best 之后 40100 步崩了。从 ckpt-40000 恢复后 best 回到
-330.38,于是 50k 步的 300.19 被当成新纪录,覆盖了更好的权重。
-
-## 硬件
-
-4090 eGPU 一天内掉出 PCI 总线六次,uptime 依次是 ~2.5h / ~2.5h / 12min / 27min / 44min /
-17min。功耗墙在 450W、350W、400W 之间试过,和 uptime 没有相关性,所以不是供电问题。
-其中一次 GPU 在两分钟内自己重新枚举,supervisor 的等待循环直接接住了,全程无人干预;
-其余几次是 `lspci` 读出 rev ff 的硬掉线,必须物理重插。最后一次重插之后连续跑了 13 小时
-没再掉。
-
-## 容量实测
-
-停机后在 4090 上重新测了一遍,`experiments/kabr/probe_capacity.py`,合成输入,16 帧,bf16 autocast,
-torch.compile 开启。
-
-| res | dim | bs x ga | params | s/step | 峰值 GiB | clips/s |
+| res | dim | bs x ga | params | s/step | peak GiB | clips/s |
 |---|---|---|---|---|---|---|
 | 64 | 64 | 4x2 | 35.7M | 0.382 | 8.79 | 20.95 |
 | 64 | 64 | 8x1 | 35.7M | 0.375 | 16.88 | 21.33 |
@@ -93,41 +77,40 @@ torch.compile 开启。
 | 128 | 64 | 2x4 | 35.7M | 2.319 | 22.50 | 3.45 |
 | 128 | 64 | 1x8 | 35.7M | 2.293 | 11.56 | 3.49 |
 
-batch 4 到 batch 8 显存翻倍 (8.79 → 16.88),吞吐只从 20.95 涨到 21.33。**把显存填满换不到
-吞吐**,这一点和 2026-07-24 那轮 benchmark 的结论一致,卡在 batch 2 就算力饱和了。所以
-"显存只用了 10G/24G" 本身不是可以改进的地方,要花掉这些显存必须同时花掉算力。
+Going from batch 4 to batch 8 doubles memory, 8.79 to 16.88 GiB, and moves throughput from
+20.95 to 21.33 clips/s. Filling VRAM does not buy throughput. This matches the benchmark
+from 2026-07-24: the card is already compute-saturated at batch 2. So "only 10G of 24G is
+in use" is not by itself an opportunity, because spending that memory means spending
+compute that is not available.
 
-参数量翻倍和像素数翻倍的代价几乎一样,都是吞吐减半。128px 是 4 倍像素,吞吐掉到 1/6。
+Doubling parameters and doubling pixel count cost about the same, roughly half the
+throughput each. 128px is four times the pixels and drops throughput to a sixth.
 
-采样路径要单独量。96px 下 `metric_batch=16` 的采样峰值 20.14 GiB,比训练峰值 19.08 还高;
-降到 8 之后采样峰值和训练峰值持平,等于完全落在训练已经占住的 pool 里。128px 在
-batch 2 下第二次测直接 OOM,只有 batch 1 稳,而 batch 1 只用 11.56 GiB。这条路既慢又
-用不满显存。
+The sampling path has to be measured on its own. At 96px with `metric_batch=16` the
+sampling peak is 20.14 GiB, above the 19.08 GiB training peak. Dropping to 8 brings the
+sampling peak level with the training peak, which means it fits entirely inside the pool
+training has already claimed. At 128px, batch 2 ran out of memory on a second attempt and
+only batch 1 was stable, and batch 1 uses just 11.56 GiB. That path is both slow and unable
+to use the memory available.
 
-## 下一个 run
+## What this implies for the next run
 
-`giraffe-96px-16f-d64-pred_v-minsnr5`,wandb `ujg8ixld`。
+Continued in `giraffe-96px-16f-d64-pred_v-minsnr5.md`, wandb `ujg8ixld`.
 
-96px / dim 64 / bs 4 x accum 2 / `metric_batch` 8 / cosine decay 到 5% / 80,000 步。
-实测 630ms/step (probe 预估 841ms,实际更快),显存 17.5G,metric block 之后 18.0G。
-80k 步约 14 小时,加 8 轮 metric block 约 16.5 小时。
+96px over 128px, because at 128px only batch 1 is stable on this card, throughput falls to
+a sixth, an equivalent-length run would take 39 hours, and it uses less memory than 96px
+rather than more. dim 64 rather than a wider model, because `fid_frame` improves throughout
+and single-frame quality is not what is limited by capacity. On 1,304 scenes a wider model
+would only reach the overfitting point sooner.
 
-启动后确认过的几件事: LR 在 1000 步到峰值 1e-4,5000 步 9.94e-5,10000 步 9.70e-5,
-cosine 在走;10,000 步的 metric block 在 `metric_batch` 8 下没有 OOM,采样峰值落在训练
-已占住的 pool 里,这是把它从 16 降到 8 的唯一目的。
+The constant learning rate is the one thing this run clearly got wrong, so the 96px run
+uses cosine decay.
 
-10,000 步第一组 metric: fvd/val 814.11 / kvd 62.01 / fid_frame 299.89 /
-novelty 0.872 / diversity 0.087 / motion 0.412。同样步数下 64px 是 547 / 32.1 / 245 /
-0.862 / 0.095 / 0.460。96px 在相同步数上更差是预期的,像素多了 2.25 倍,同样步数下模型
-见过的信息更少,而 FVD 和 FID 本身对分辨率敏感。这两组数不构成比较,只是记录起点。
+`metric_protocol` moves from v1 to v2 because `metric_batch` changes from 16 to 8. Chunk
+size does not change the sample distribution, but it does change which noise each sample
+draws under a fixed seed, so the numbers are not exactly comparable. FVD is already
+incomparable across a resolution change; the protocol tag just makes the second change
+explicit.
 
-选 96px 不选 128px,是因为 128px 在这张卡上只有 batch 1 能稳定跑,吞吐掉到 1/6,一个
-等效长度的 run 要 39 小时,而且显存反而用得比 96px 少。选 dim 64 不加宽,是因为
-`fid_frame` 一路在改善,单帧质量不是被容量卡住的;1304 个场景上加宽只会更早过拟合。
-
-`metric_protocol` 从 v1 改成 v2,因为 `metric_batch` 从 16 改成了 8。分块大小不改变样本
-分布,但会改变固定 seed 下每个样本拿到的噪声,数值上不完全可比。分辨率变了之后 FVD 本来
-就和 64px 的 run 不可比,这里只是把改动标出来。
-
-真正的下一个问题不是模型多大,是 1304 个 mini-scene 够不够。本地只有 giraffe,
-`raw/KABR` 里没有 zebra 的帧。
+The open question is not model size. It is whether 1,304 mini-scenes is enough. Only
+giraffe is available locally, and `raw/KABR` has no zebra frames.

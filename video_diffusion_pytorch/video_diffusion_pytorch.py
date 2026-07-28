@@ -35,7 +35,7 @@ from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
-from einops import rearrange
+from einops import rearrange, reduce
 from einops_exts import check_shape, rearrange_many
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -760,6 +760,18 @@ class GaussianDiffusion(nn.Module):
         text_use_bert_cls: embed captions with BERT's [CLS] token instead of a token mean.
         use_dynamic_thres: clamp predicted x0 to a per-sample quantile instead of +-1.
         dynamic_thres_percentile: the quantile used when `use_dynamic_thres` is on.
+        objective: what the network regresses onto - 'pred_noise' (epsilon, the default and
+            the original behaviour), 'pred_x0', or 'pred_v' (velocity,
+            https://arxiv.org/abs/2202.00512).
+        min_snr_loss_weight: weight the per-clip loss by min(SNR, gamma) rescaled for the
+            chosen objective, from https://arxiv.org/abs/2303.09556. Off by default.
+        min_snr_gamma: the gamma above.
+        sampling_timesteps: number of DDIM steps. `None` keeps the full T-step ancestral
+            sampler, which is what `sample` used before DDIM existed here.
+        ddim_sampling_eta: 0 is deterministic DDIM, 1 recovers the DDPM-like stochastic path.
+
+    Every added argument defaults to the pre-existing behaviour, so a call site that does
+    not pass them gets exactly the epsilon-prediction DDPM this class always was.
     """
 
     def __init__(
@@ -773,13 +785,21 @@ class GaussianDiffusion(nn.Module):
         timesteps = 1000,
         loss_type = 'l1',
         use_dynamic_thres = False, # from the Imagen paper
-        dynamic_thres_percentile = 0.9
+        dynamic_thres_percentile = 0.9,
+        objective = 'pred_noise',
+        min_snr_loss_weight = False,
+        min_snr_gamma = 5.,
+        sampling_timesteps = None,
+        ddim_sampling_eta = 0.
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, f'unknown objective {objective}'
+        self.objective = objective
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -821,6 +841,34 @@ class GaussianDiffusion(nn.Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
+        # loss weighting
+        #
+        # min-SNR (https://arxiv.org/abs/2303.09556) treats denoising at different noise
+        # levels as competing tasks and caps the weight of the easy, low-noise ones. The
+        # rescaling differs per objective because the same clamp(snr, gamma) has to be
+        # expressed in whatever space the network is regressing in.
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+        maybe_clipped_snr = snr.clone()
+        if min_snr_loss_weight:
+            maybe_clipped_snr.clamp_(max = min_snr_gamma)
+
+        if objective == 'pred_noise':
+            loss_weight = maybe_clipped_snr / snr
+        elif objective == 'pred_x0':
+            loss_weight = maybe_clipped_snr
+        else:
+            loss_weight = maybe_clipped_snr / (snr + 1)
+
+        register_buffer('loss_weight', loss_weight)
+
+        # sampling
+
+        self.sampling_timesteps = default(sampling_timesteps, self.num_timesteps)
+        assert self.sampling_timesteps <= self.num_timesteps
+        self.is_ddim_sampling = self.sampling_timesteps < self.num_timesteps
+        self.ddim_sampling_eta = ddim_sampling_eta
+
         # text conditioning parameters
 
         self.text_use_bert_cls = text_use_bert_cls
@@ -844,6 +892,52 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
+    def predict_noise_from_start(self, x_t, t, x0):
+        """Inverse of `predict_start_from_noise`: recover epsilon from x_t and a predicted x0."""
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
+
+    def predict_v(self, x_start, t, noise):
+        """The velocity target v = sqrt(a_bar) eps - sqrt(1 - a_bar) x0."""
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+        )
+
+    def predict_start_from_v(self, x_t, t, v):
+        """Recover x0 from x_t and a predicted velocity."""
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def model_predictions(self, x, t, cond = None, cond_scale = 1., clip_x_start = False):
+        """Normalize whatever the network predicts into a (pred_noise, pred_x_start) pair.
+
+        Every sampler downstream works in these two quantities, so `objective` only has to
+        be handled here. `clip_x_start` clamps x0 to [-1, 1] and re-derives epsilon from the
+        clamped value, which is what keeps DDIM stable at low step counts.
+        """
+        model_output = self.denoise_fn.forward_with_cond_scale(x, t, cond = cond, cond_scale = cond_scale)
+
+        if self.objective == 'pred_noise':
+            pred_noise = model_output
+            x_start = self.predict_start_from_noise(x, t, pred_noise)
+        elif self.objective == 'pred_x0':
+            x_start = model_output
+            pred_noise = self.predict_noise_from_start(x, t, x_start)
+        else:
+            x_start = self.predict_start_from_v(x, t, model_output)
+            pred_noise = self.predict_noise_from_start(x, t, x_start)
+
+        if clip_x_start:
+            x_start = x_start.clamp(-1., 1.)
+            pred_noise = self.predict_noise_from_start(x, t, x_start)
+
+        return pred_noise, x_start
+
     def q_posterior(self, x_start, x_t, t):
         """Moments of the tractable posterior q(x_{t-1} | x_t, x_0)."""
         posterior_mean = (
@@ -864,7 +958,7 @@ class GaussianDiffusion(nn.Module):
         (https://arxiv.org/abs/2205.11487), which keeps high guidance scales from washing
         out saturated samples.
         """
-        x_recon = self.predict_start_from_noise(x, t=t, noise = self.denoise_fn.forward_with_cond_scale(x, t, cond = cond, cond_scale = cond_scale))
+        _, x_recon = self.model_predictions(x, t, cond = cond, cond_scale = cond_scale)
 
         if clip_denoised:
             s = 1.
@@ -913,11 +1007,58 @@ class GaussianDiffusion(nn.Module):
         return unnormalize_img(img)
 
     @torch.inference_mode()
+    def ddim_sample(self, shape, cond = None, cond_scale = 1., clip_denoised = True):
+        """Deterministic (eta = 0) DDIM sampling over a strided subset of the schedule.
+
+        https://arxiv.org/abs/2010.02502. Nothing here is rank-aware: the frame axis rides
+        along inside `shape` and inside `extract`'s broadcast, exactly as it does in the
+        ancestral loop. The win is purely in the step count - `sampling_timesteps` network
+        evaluations instead of `num_timesteps`.
+
+        x0 is clamped every step and epsilon is re-derived from the clamped value, without
+        which low step counts drift out of range.
+        """
+        device = self.betas.device
+        b = shape[0]
+        total, sampling_timesteps, eta = self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta
+
+        # [-1, ..., total - 1], reversed and paired into (t, t_prev); t_prev == -1 is the
+        # final step into x0, where alpha_bar_prev is defined as 1.
+        times = torch.linspace(-1, total - 1, steps = sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        img = torch.randn(shape, device = device)
+
+        for time, time_next in tqdm(time_pairs, desc = 'ddim sampling loop time step'):
+            time_cond = torch.full((b,), time, device = device, dtype = torch.long)
+            pred_noise, x_start = self.model_predictions(img, time_cond, cond = cond, cond_scale = cond_scale, clip_x_start = clip_denoised)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img) if eta > 0 else 0.
+
+            img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
+        return unnormalize_img(img)
+
+    @torch.inference_mode()
     def sample(self, cond = None, cond_scale = 1., batch_size = 16):
         """Sample clips of shape (batch, channels, num_frames, image_size, image_size).
 
         Raw caption strings passed as `cond` are tokenized and BERT-embedded here; a
         pre-computed tensor is used as is, and its leading dim overrides `batch_size`.
+
+        Dispatches to DDIM when `sampling_timesteps` was set below `timesteps`, otherwise
+        to the full ancestral chain.
         """
         device = next(self.denoise_fn.parameters()).device
 
@@ -928,7 +1069,10 @@ class GaussianDiffusion(nn.Module):
         image_size = self.image_size
         channels = self.channels
         num_frames = self.num_frames
-        return self.p_sample_loop((batch_size, channels, num_frames, image_size, image_size), cond = cond, cond_scale = cond_scale)
+        shape = (batch_size, channels, num_frames, image_size, image_size)
+
+        sample_fn = self.ddim_sample if self.is_ddim_sampling else self.p_sample_loop
+        return sample_fn(shape, cond = cond, cond_scale = cond_scale)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -961,10 +1105,15 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, cond = None, noise = None, **kwargs):
-        """Simple DDPM loss: regress the network output onto the sampled noise.
+        """Regress the network output onto whatever `objective` selects, then weight it.
 
-        Defaults to L1 rather than the usual L2. Extra kwargs (`prob_focus_present`,
-        `focus_present_mask`) pass straight through to `Unet3D.forward`.
+        The loss is reduced per clip before weighting, because the min-SNR weight is a
+        function of t and t is drawn per clip. With the defaults (`pred_noise`, no min-SNR)
+        `loss_weight` is all ones and this reduces to the plain mean over every element,
+        i.e. the same scalar the epsilon-only version returned.
+
+        Extra kwargs (`prob_focus_present`, `focus_present_mask`) pass straight through to
+        `Unet3D.forward`.
         """
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -975,16 +1124,25 @@ class GaussianDiffusion(nn.Module):
             cond = bert_embed(tokenize(cond), return_cls_repr = self.text_use_bert_cls)
             cond = cond.to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond = cond, **kwargs)
+        model_out = self.denoise_fn(x_noisy, t, cond = cond, **kwargs)
+
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        else:
+            target = self.predict_v(x_start, t, noise)
 
         if self.loss_type == 'l1':
-            loss = F.l1_loss(noise, x_recon)
+            loss = F.l1_loss(model_out, target, reduction = 'none')
         elif self.loss_type == 'l2':
-            loss = F.mse_loss(noise, x_recon)
+            loss = F.mse_loss(model_out, target, reduction = 'none')
         else:
             raise NotImplementedError()
 
-        return loss
+        loss = reduce(loss, 'b ... -> b', 'mean')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
 
     def forward(self, x, *args, **kwargs):
         """x: (b, c, f, h, w) in [0, 1] -> scalar loss.

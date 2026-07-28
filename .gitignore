@@ -1,3 +1,15 @@
+AGENTS.md
+TODO.md
+PROGRESS.md
+autonomy/
+
+# Generation results
+results*/
+
+# experiment datasets and wandb logs
+experiments/**/data/
+wandb/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -127,3 +139,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+

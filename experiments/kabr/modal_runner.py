@@ -41,7 +41,12 @@ RUNS_VOLUME = "kabr-runs"    # checkpoints, media, wandb state, spend ledger
 
 GPU_TYPE = "L4"              # 24 GB, same Ada generation as the card this run started on
 GPU_HOURLY_USD = 0.80
-BUDGET_USD = 30.0
+# The run is projected at $30.2 against a $30 target. This ceiling is a runaway guard, not
+# the target: it is checked before a chunk starts, so setting it at the target would let a
+# chunk-sized rounding error end the run a few hundred steps short of the horizon and
+# throw away the tail of the cosine decay - the exact mistake this run is trying not to
+# repeat. One chunk of headroom costs $4 in the worst case and nothing in the expected one.
+BUDGET_USD = 34.0
 
 RUN_NAME = "giraffe-96px-16f-d64-pred_v-minsnr5"
 IMAGE_SIZE = 96

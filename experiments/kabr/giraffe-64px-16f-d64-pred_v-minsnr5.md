@@ -56,6 +56,18 @@ than the plus or minus 10 I first estimated off the three points between 40k and
 at the wider band, the move from 282 to 350 sits outside it and runs monotonically across
 four consecutive blocks, so it is a real regression rather than scatter.
 
+The 282.33 itself should not be read as a quality figure. It is below the 326.1 measured
+for real train clips against real val clips, and a model cannot genuinely sit closer to the
+validation set than held-out real data does. The cause is the estimator rather than the
+model: I3D returns 400-dimensional features and `metric_samples` is 256, so the sample
+covariance has rank at most 255 and is singular. Under that rank deficiency the generated
+covariance term in `Tr(Sigma_r + Sigma_g - 2(Sigma_r Sigma_g)^(1/2))` is systematically
+underestimated, and the estimator pays a model for producing less varied samples.
+`diversity/gen` never exceeding 91% of real data is the deficiency being rewarded. `kvd`
+is an unbiased MMD estimator and does not have this problem at this sample size, so it is
+the number to compare across steps. It puts the same minimum at 60k, which is why the
+conclusion above survives; the absolute FVD values do not.
+
 `nn/novelty_ratio` rises across the whole run and holds at 1.21 to 1.24 after 120k. Values
 above 1 mean generated samples sit farther from the training set than held-out validation
 clips do, which rules out memorisation as the cause of the regression. `diversity/gen`

@@ -192,6 +192,10 @@ class Config:
 
     # ---- bookkeeping ------------------------------------------------------
     run_name: str = ""
+    # Appended to the derived run name. This is how an arm that differs from the default by
+    # something the name does not encode - the control, which differs by absence - gets its
+    # own identity without hardcoding a name that then lies about the image size.
+    run_suffix: str = ""
     wandb_project: str = "kabr-video-diffusion"
     # Passed straight to `wandb.init`, where it overrides the WANDB_MODE environment
     # variable rather than deferring to it. Defaulting from the environment is what makes
@@ -231,12 +235,21 @@ class Config:
             cond = "".join(("-behav" if self.cond_behaviour else "",
                             "-spec" if self.cond_species else ""))
             shift = "" if self.schedule_shift == 1.0 else f"-shift{self.schedule_shift:g}"
+            suffix = f"-{self.run_suffix}" if self.run_suffix else ""
             self.run_name = (
                 f"{self.species_slug}-{self.image_size}px-{self.num_frames}f"
                 f"-d{self.dim}-{self.objective}"
                 f"{'-minsnr' + str(int(self.min_snr_gamma)) if self.min_snr_loss_weight else ''}"
-                f"{shift}{cond}"
+                f"{shift}{cond}{suffix}"
             )
+        # The remote push is nested inside the ckpt_every block, because pushing a checkpoint
+        # that was never written is not a thing. That makes a cadence which is not a multiple
+        # of ckpt_every fire late or never, silently, which is only discovered when a session
+        # dies and takes more with it than it should have.
+        if self.ckpt_remote_every and self.ckpt_remote_every % self.ckpt_every:
+            raise SystemExit(
+                f"ckpt_remote_every ({self.ckpt_remote_every}) must be a multiple of "
+                f"ckpt_every ({self.ckpt_every}), or it will not fire when you expect")
 
     def resolve_device(self) -> str:
         if self.device != "auto":

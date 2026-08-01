@@ -67,10 +67,10 @@ ARMS: dict[str, list[str]] = {
         "--metric-class-samples", "64",
     ],
     # The control. Same schedule, same optimiser, same protocol, no condition - without it
-    # any improvement is attributable to four changes at once.
-    "control": COMMON + [
-        "--run-name", "giraffe-96px-16f-d64-pred_v-minsnr5-shift0.667-control",
-    ],
+    # any improvement is attributable to four changes at once. A suffix rather than a literal
+    # name, so that running this at another resolution does not leave the control claiming to
+    # be the 96px run and resuming from its checkpoint.
+    "control": COMMON + ["--run-suffix", "control"],
 }
 
 

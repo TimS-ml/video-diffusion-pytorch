@@ -51,19 +51,26 @@ def kaggle_username() -> str:
     cfg = cfg_dir / "kaggle.json"
     if cfg.exists():
         return json.loads(cfg.read_text())["username"]
-    try:
-        out = subprocess.run(["kaggle", "config", "view"], capture_output=True, text=True,
-                             check=True, timeout=60).stdout
-        for line in out.splitlines():
-            if line.strip().startswith("- username:"):
-                name = line.split(":", 1)[1].strip()
-                if name and name != "None":
-                    return name
-    except Exception:
-        pass
+    # The CLI touches the network on its first call, so this occasionally times out on a
+    # machine that is otherwise authenticated. Retry once, and report what actually went
+    # wrong instead of the generic "not authenticated" message, which sends you looking in
+    # the wrong place.
+    problem = "no '- username:' line in the output"
+    for _ in range(2):
+        try:
+            out = subprocess.run(["kaggle", "config", "view"], capture_output=True, text=True,
+                                 check=True, timeout=60).stdout
+            for line in out.splitlines():
+                if line.strip().startswith("- username:"):
+                    name = line.split(":", 1)[1].strip()
+                    if name and name != "None":
+                        return name
+        except Exception as exc:
+            problem = f"{type(exc).__name__}: {exc}"
     raise SystemExit(
-        f"cannot resolve a Kaggle username. Authenticate the CLI (an access token at "
-        f"{cfg_dir / 'access_token'}, or kaggle.json), or set KAGGLE_USERNAME")
+        f"cannot resolve a Kaggle username from `kaggle config view` ({problem}).\n"
+        f"Authenticate the CLI (an access token at {cfg_dir / 'access_token'}, or "
+        f"kaggle.json), or set KAGGLE_USERNAME to skip the lookup")
 
 
 def metadata(slug: str, private: bool) -> dict:

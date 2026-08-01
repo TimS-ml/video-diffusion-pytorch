@@ -48,8 +48,9 @@ COMMON = [
     "--weight-decay", "0.01",
     "--resume", "auto",       # find my own previous chunk
     "--ckpt-artifact",        # and leave the next one behind
-    "--no-compile-model",     # a failed compile costs the whole session; turn it on once a
-                              # session is known to work end to end
+    # Measured on a T4, not assumed: 4.7 s/step compiled against about 8 extrapolated from
+    # the uncompiled 64px run, for roughly 100 s of compilation once per chunk.
+    "--compile-model",
 ]
 
 ARMS: dict[str, list[str]] = {

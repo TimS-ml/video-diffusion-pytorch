@@ -86,17 +86,49 @@ one GPU instead of two, the runner drops the extra arms rather than oversubscrib
   arithmetic, is the problem.
 - **16 GB.** 96px runs at batch 2 with accumulation 4, the same effective batch 8 as the
   recorded runs.
-- **`torch.compile` is off** in the preset. A failed compile costs the whole session; turn it
-  on once a session is known to work end to end.
-- **Throughput, measured.** 3.58 s/step at 64px, batch 2 x accumulation 4, fp16, no compile
-  (226 steps in a 900 s chunk). The same 8 clips per step take 0.57 s on a 4090 running
-  eager, so a T4 is about 6x slower here — more than the 3.2x its memory bandwidth accounts
-  for, which is what makes `torch.compile` worth measuring rather than assuming.
+- **`torch.compile` is on**, after measuring it rather than assuming. Compilation costs about
+  100 s once per chunk and inductor warns `Not enough SMs to use max_autotune_gemm`, which is
+  true and does not stop it being worth it.
 
-  That number sets the plan rather than decorating it. Scaling by pixel count, 96px lands
-  near 8 s/step, so an 11 hour chunk is roughly 5k steps and the step 40k the 96px baseline
-  peaked at is about 8 sessions per arm. Kaggle allows 30 GPU hours a week and two arms
-  share one session, so 96px to 40k is a three week plan and 64px to 40k is about one.
+### Throughput, measured on a session
+
+| config | s/step | note |
+|---|---|---|
+| 64px, no compile, 1 arm | 3.58 | 226 steps in a 900 s chunk |
+| 96px, compile, 2 arms concurrent | 4.70 | both arms within 0.02 s of each other |
+
+96px is 2.25x the pixels of 64px, so uncompiled it would land near 8 s/step. Compiled it runs
+at 4.7, which is the same ~1.7x the 4090 saw. Running both arms at once costs nothing
+measurable, because each has its own card and the dataloader is not the bottleneck.
+
+A step is 8 clips (batch 2 x accumulation 4), the same effective batch as the recorded runs.
+For reference a 4090 does that step in 0.57 s eager, so a T4 is about 8x slower.
+
+**What that means for the plan.** An 11 hour chunk is roughly 8k steps per arm after the
+metric block takes its share. Step 40k, where the 96px baseline peaked, is about five
+sessions. Kaggle allows 30 GPU hours a week and both arms share one session, so this is a
+two week plan at 96px for both arms together.
+
+The conditioned arm is slower per session than the control (187 steps against 300 in the
+smoke) because guidance runs the network twice during sampling and it also pays for the
+per-behaviour block. That gap is almost entirely metric cost, not training cost.
+
+## Smoke before a long chunk
+
+A short session with the expensive blocks pulled forward, because the failures worth finding
+early are the ones that only happen in a metric block:
+
+    python experiments/kabr/kaggle/submit.py push --slug kabr-smoke \
+      --set KABR_CHUNK_SECONDS=2400 --set KABR_IMAGE_SIZE=96 \
+      --set "KABR_EXTRA=--metric-every 150 --metric-samples 16 --metric-ref-samples 64 \
+             --metric-batch 2 --flow-clips 8 --kvd-subset-size 8 --metric-class-samples 4"
+
+`--set` injects `KABR_*` settings into the staged copy of the entry script, since a kernel has
+no environment to set from outside. `KABR_EXTRA` is forwarded verbatim to every arm.
+
+This is how the missing `torch-fidelity` was found: torchmetrics is in the Kaggle image but
+the backend its FID needs is not, and that only raises when the metric object is constructed.
+17 minutes to find, against the 10 hours it would have cost at the default interval.
 
 ## Paths
 

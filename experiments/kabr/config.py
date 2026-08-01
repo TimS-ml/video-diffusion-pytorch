@@ -199,15 +199,16 @@ class Config:
     wandb_mode: str = ""
     data_root: str = ""
     out_root: str = ""
-    # A path, or "auto" to take the newest wandb checkpoint artifact for this run name and
-    # fall back to whatever is already on disk. "auto" is what a hosted session wants: it
-    # starts with an empty disk and has to find its own previous chunk.
+    # A path, or "auto" to take the newest remote checkpoint for this run name and fall back
+    # to whatever is already on disk. "auto" is what a hosted session wants: it starts with
+    # an empty disk and has to find its own previous chunk.
     resume: str = ""
-    # Log the checkpoint as a wandb artifact at the end of every chunk, and every
-    # `ckpt_artifact_every` steps if that is set. Artifact storage is content addressed, so
-    # the best-*.pt files that did not change cost nothing to include again.
-    ckpt_artifact: bool = False
-    ckpt_artifact_every: int = 0
+    # Where the resume state goes: a comma list of "hf" and "wandb", empty for neither. Push
+    # happens at the end of every chunk, and every `ckpt_remote_every` steps if that is set.
+    # Resume reads them in this order and takes the first that has something. See
+    # `remote_sync` for why hf is the one to put first.
+    ckpt_remote: str = ""
+    ckpt_remote_every: int = 0
 
     def __post_init__(self):
         if not self.data_root:

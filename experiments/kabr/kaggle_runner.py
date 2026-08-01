@@ -4,10 +4,12 @@ A session is a fixed block of wall clock that ends whether or not the run is fin
 it keeps nothing afterwards. Everything here follows from that:
 
   cache from the hub          `hf_sync.pull_cache` once, symlinked out of the hub cache.
-  resume from wandb           each arm runs with `--resume auto --ckpt-artifact`, so the
-                              trainer pulls its own previous chunk and logs the next one.
+  resume from the hub         each arm runs with `--resume auto --ckpt-remote hf`, so the
+                              trainer pulls its own previous chunk and pushes the next one.
                               The chunk stops on `stop_after_seconds`, not `train_steps`, so
-                              it always writes a checkpoint before the session is cut.
+                              it always writes a checkpoint before the session is cut. The
+                              checkpoint goes to the dataset repo rather than to wandb so
+                              that losing the metrics backend does not cost the training.
   two cards, two arms         The two T4s run different configurations rather than one
                               data-parallel run. At this model size a T4 saturates around
                               batch 2 and the interesting comparison is between recipes, so
@@ -47,7 +49,11 @@ COMMON = [
     "--schedule-shift", "0.667",  # 64 / 96, the resolution the cosine schedule was tuned at
     "--weight-decay", "0.01",
     "--resume", "auto",       # find my own previous chunk
-    "--ckpt-artifact",        # and leave the next one behind
+    "--ckpt-remote", "hf",    # and leave the next one behind, on the dataset repo
+    # Every 2000 steps as well as at the end, so a session killed without warning (the
+    # dropped eGPU is the reminder that this happens) loses at most a few hours rather than
+    # the whole chunk. Uploading 572 MB takes about a minute against 2.6 hours of training.
+    "--ckpt-remote-every", "2000",
     # Measured on a T4, not assumed: 4.7 s/step compiled against about 8 extrapolated from
     # the uncompiled 64px run, for roughly 100 s of compilation once per chunk.
     "--compile-model",

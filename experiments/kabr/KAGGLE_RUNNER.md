@@ -23,14 +23,30 @@ path may call `input()`.
 | what | where | why |
 |---|---|---|
 | clip cache | HF dataset `TimS-ml/kabr-video-diffusion`, `cache/<slug>_<size>px/` | large, static, shared by every run, useful to anyone reproducing this |
-| checkpoints | wandb artifact `ckpt-<run name>`, alias `latest` | per run, rewritten every chunk, only meaningful next to the curves that produced them |
-| final weights | the same HF dataset, `runs/<run name>/` | publishing a finished run, not resuming one |
+| resume state | the same dataset, `chunks/<run name>/` | rewritten every chunk, interesting only until the next one lands |
+| final weights | the same dataset, `runs/<run name>/` | publishing a finished run, not resuming one |
+| curves | wandb `kabr-video-diffusion` | metrics, samples, previews |
 
-Artifact storage is content addressed, so the `best-*.pt` files that did not change between
-chunks cost nothing to include again. Each version carries the resume checkpoint, the
-`best-*.pt` record, `config.json` and `wandb_id.txt` — the last is what keeps a chained run
-on one continuous set of curves, and the `best-*.pt` record is what stops a new chunk's
-first metric block from overwriting a better result it never saw.
+A chunk carries the resume checkpoint, the `best-*.pt` record, `config.json`, `wandb_id.txt`
+and a small `state.json`. `wandb_id.txt` is what keeps a chained run on one continuous set of
+curves. The `best-*.pt` record is what stops a new chunk's first metric block from overwriting
+a better result it never saw. `state.json` holds the step, so progress can be read without
+pulling 572 MB to find out:
+
+    python -m kabr.hf_sync state --run-name giraffe-96px-...
+
+The checkpoint is always written as `ckpt-latest.pt` rather than under its step number, so
+the newest one is found by name with no listing and no tie to break. Hub commits are atomic
+and the whole chunk goes up as one commit, so a session killed mid-upload leaves the previous
+chunk intact rather than a checkpoint that disagrees with its own best record.
+
+**Why the dataset rather than a wandb artifact.** Both work, and `--ckpt-remote hf,wandb`
+writes to both. The dataset is the default because it puts resumability and metrics logging
+on separate failures. A wandb key that is missing, rate limited or out of quota used to cost
+the entire chunk, because the checkpoint had nowhere else to go; now the worst case is losing
+curves, which are cheap, rather than eleven hours of training, which are not. A checkpoint is
+572 MB and wandb's free tier holds 100 GB, which two arms pushing every chunk would reach
+before the experiment finished.
 
 ## Submitting
 
@@ -44,11 +60,20 @@ because it carries a `<username>/<slug>` id that is wrong for anyone who forks t
 
 **One manual step.** `HF_TOKEN` and `WANDB_API_KEY` have to be attached through Add-ons →
 Secrets on the kernel's editor page, once, after the first push. The API has no field for
-attaching secrets. Without `WANDB_API_KEY` the chunk still trains but logs offline, which
-means it leaves no artifact and cannot be resumed from.
+attaching secrets.
+
+`HF_TOKEN` is the one that matters, and it needs write scope on the dataset repo. Without it
+the cache still loads, because reading a public dataset needs no token, but the chunk has
+nowhere to put its checkpoint and the session is a smoke test rather than a step of the run.
+Without `WANDB_API_KEY` the chunk trains and remains resumable; only the dashboard is lost.
+
+The trainer proves it can write before it trains, with one small commit, rather than
+discovering an expired or read-only token at the end of the chunk when there is no time left
+to do anything about it.
 
 Resubmitting continues the run rather than restarting it, because each arm runs with
-`--resume auto`.
+`--resume auto`. Checkpoints also go up every 2000 steps, not only at the end, so a session
+killed without warning loses a couple of hours rather than the whole chunk.
 
 ## The entry point
 

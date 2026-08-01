@@ -132,20 +132,21 @@ def secret(name: str) -> str | None:
         return None
 
 
-# Reading the cache off a public dataset needs no token, so a missing HF_TOKEN is only a
-# problem for writing back, which this session does not do.
+# HF_TOKEN is the one that decides whether this session is a step of the run or a smoke
+# test. Reading the cache off a public dataset needs no token; writing the checkpoint back
+# does, and that checkpoint is the only thing the session leaves behind.
 if token := secret("HF_TOKEN"):
     os.environ["HF_TOKEN"] = token
 else:
-    print("no HF_TOKEN secret: public reads still work, pushing to the dataset will not")
+    print("no HF_TOKEN secret: the cache still loads, but THIS CHUNK WILL NOT BE RESUMABLE")
 
+# wandb holds the curves, not the resume state, so a missing key costs the dashboard rather
+# than the training. Offline runs still write their logs into the run directory.
 if key := secret("WANDB_API_KEY"):
     os.environ["WANDB_API_KEY"] = key
 else:
-    # Without wandb there is nowhere to put the checkpoint, so the chunk cannot be resumed
-    # from and the session is a smoke test rather than a step of the run.
     os.environ["WANDB_MODE"] = "offline"
-    print("no WANDB_API_KEY secret: logging offline, THIS CHUNK WILL NOT BE RESUMABLE")
+    print("no WANDB_API_KEY secret: logging offline, curves will not appear on the dashboard")
 
 os.environ["KABR_OUT_ROOT"] = str(SCRATCH / "kabr_out")
 os.environ["KABR_HF_REPO"] = os.environ.get("KABR_HF_REPO", "TimS-ml/kabr-video-diffusion")
@@ -182,12 +183,12 @@ print("cache version", idx.version,
 # ## Train
 #
 # One arm per card, both stopping on wall clock, output interleaved and tagged. Each arm
-# resumes from its own `latest` artifact, so resubmitting this kernel continues the run
-# rather than restarting it. If the session comes up with one GPU instead of two, the runner
-# drops the extra arms rather than oversubscribing a card.
+# resumes from its own `chunks/<run>/ckpt-latest.pt` on the dataset repo, so resubmitting
+# this kernel continues the run rather than restarting it. If the session comes up with one
+# GPU instead of two, the runner drops the extra arms rather than oversubscribing a card.
 #
-# Expect roughly 2.5-3 s/step per T4 at 96px, so an 11 hour chunk is on the order of 14k
-# steps and the 70k horizon is about five sessions per arm.
+# Measured: 4.70 s/step per T4 at 96px with compile, so an 11 hour chunk is roughly 8k steps
+# and the 70k horizon is about nine sessions per arm.
 
 # %%
 rc = subprocess.run(
@@ -201,18 +202,19 @@ print("session exit", rc, flush=True)
 # %% [markdown]
 # ## What came back
 #
-# The artifact push happens inside the trainer, at the end of the chunk and before wandb is
-# closed, so a chunk that ran out of wall clock still leaves its progress behind. This is the
-# receipt, and the only thing worth reading in the kernel log afterwards.
+# The push happens inside the trainer, at the end of the chunk, so a chunk that ran out of
+# wall clock still leaves its progress behind. This reads the step back off the hub rather
+# than off the local disk, because the local disk is about to be deleted and what matters is
+# what actually landed. A step here that does not match the log is the failure to chase.
 
 # %%
-from kabr import wandb_sync
+from kabr import hf_sync
 from kabr.kaggle_runner import arm_config
 
 for arm in ARMS.split(","):
     arm_cfg = arm_config(arm, ["--image-size", str(IMAGE_SIZE), *EXTRA])
-    print(f"{arm}: artifact {wandb_sync.artifact_name(arm_cfg)}"
-          f" | local {wandb_sync.latest_local(arm_cfg.run_dir)}")
+    state = hf_sync.chunk_state(arm_cfg)
+    print(f"{arm}: {hf_sync.chunk_prefix(arm_cfg)} -> {state or 'NOTHING PUSHED'}")
 
 if rc != 0:
     raise SystemExit(rc)

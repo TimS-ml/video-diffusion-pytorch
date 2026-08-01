@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 
 import wandb
 from kabr import metrics as M
-from kabr import wandb_sync
+from kabr import remote_sync
 from kabr.config import Config, parse_config
 from kabr.data import (KabrClips, class_rows, cycle, deterministic_clips, make_cond_spec,
                        window_conds)
@@ -620,10 +620,9 @@ class Trainer:
             log.update(self.save_best(log))
             if self.step % cfg.ckpt_every == 0:
                 path = self.save(str(self.step))
-                if cfg.ckpt_artifact and cfg.ckpt_artifact_every \
-                        and self.step % cfg.ckpt_artifact_every == 0:
-                    wandb_sync.push_checkpoint(cfg, run, path, self.step,
-                                               {"reason": "milestone"})
+                if cfg.ckpt_remote_every and self.step % cfg.ckpt_remote_every == 0:
+                    remote_sync.push_checkpoint(cfg, run, path, self.step,
+                                                {"reason": "milestone"})
 
             wandb.log(log)
             if self.step % 100 == 0:
@@ -644,14 +643,10 @@ class Trainer:
         # from it and nothing downstream mistakes a partial run for a finished one.
         done = self.step >= cfg.train_steps
         path = self.save("final" if done else str(self.step))
-        # After the save and before finish: this artifact is the only thing a session that
-        # is about to be reclaimed leaves behind.
-        if cfg.ckpt_artifact:
-            try:
-                wandb_sync.push_checkpoint(cfg, run, path, self.step,
-                                           {"reason": stop_reason, "done": done})
-            except Exception as exc:
-                print(f"artifact push failed: {type(exc).__name__}: {exc}", flush=True)
+        # After the save and before finish: this is the only thing a session that is about to
+        # be reclaimed leaves behind.
+        remote_sync.push_checkpoint(cfg, run, path, self.step,
+                                    {"reason": stop_reason, "done": done})
         wandb.finish()
         print(f"KABR_STATUS {json.dumps({'step': self.step, 'done': done, 'reason': stop_reason, 'train_steps': cfg.train_steps})}",
               flush=True)
@@ -660,9 +655,14 @@ class Trainer:
 
 def main():
     cfg = parse_config()
+    # Before anything expensive: a credential that cannot write fails identically to one that
+    # can until the push at the end of the chunk, which is the worst possible time to find
+    # out. Not fatal, because a smoke run with no credentials is a legitimate thing to want.
+    for problem in remote_sync.preflight(cfg):
+        print(f"WARNING: {problem}", flush=True)
     # Before the Trainer, because "auto" restores wandb_id.txt and the best-*.pt record into
     # the run directory, and both have to be there before training rather than after.
-    resume = wandb_sync.resolve_resume(cfg)
+    resume = remote_sync.resolve_resume(cfg)
     trainer = Trainer(cfg)
     if resume:
         trainer.load(resume)

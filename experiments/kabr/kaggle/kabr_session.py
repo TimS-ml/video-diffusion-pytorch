@@ -137,10 +137,11 @@ if os.environ.get("KABR_PROBE_SECRETS") == "1":
     import urllib.request
 
     print("KAGGLE_* present:", sorted(k for k in os.environ if "KAGGLE" in k.upper()))
-    mounted = sorted(p.name for p in Path("/kaggle/input").glob("*")) \
-        if Path("/kaggle/input").exists() else []
-    print("mounted datasets:", mounted)
-    for found in sorted(Path("/kaggle/input").glob(f"*/{SECRETS_FILE}")):
+    root = Path("/kaggle/input")
+    print("mounted under /kaggle/input:",
+          sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())[:20]
+          if root.exists() else "nothing")
+    for found in sorted(root.rglob(SECRETS_FILE)):
         # Names only. Printing a token into a kernel log would defeat the point of all this.
         print(f"  {found} holds {sorted(json.loads(found.read_text()))}")
     jwt = os.environ.get("KAGGLE_USER_SECRETS_TOKEN")
@@ -185,9 +186,12 @@ def from_dataset(name: str) -> str | None:
     workflow where every session is a push they are never there when it counts. A dataset
     source is set by the same API that does the pushing, so it reattaches itself.
 
-    Globbed rather than named, so renaming the dataset does not silently stop this working.
+    Searched recursively rather than at a fixed depth, because the mount layout is not
+    stable across kernels: one mounts this at /kaggle/input/kabr-secrets/, another at
+    /kaggle/input/datasets/<owner>/<slug>/, with identical metadata on both. Matching on the
+    file name is the part that holds still.
     """
-    for path in sorted(Path("/kaggle/input").glob(f"*/{SECRETS_FILE}")):
+    for path in sorted(Path("/kaggle/input").rglob(SECRETS_FILE)):
         try:
             if value := json.loads(path.read_text()).get(name):
                 print(f"  {name} from {path.parent.name}")

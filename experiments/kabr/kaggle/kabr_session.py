@@ -137,6 +137,12 @@ if os.environ.get("KABR_PROBE_SECRETS") == "1":
     import urllib.request
 
     print("KAGGLE_* present:", sorted(k for k in os.environ if "KAGGLE" in k.upper()))
+    mounted = sorted(p.name for p in Path("/kaggle/input").glob("*")) \
+        if Path("/kaggle/input").exists() else []
+    print("mounted datasets:", mounted)
+    for found in sorted(Path("/kaggle/input").glob(f"*/{SECRETS_FILE}")):
+        # Names only. Printing a token into a kernel log would defeat the point of all this.
+        print(f"  {found} holds {sorted(json.loads(found.read_text()))}")
     jwt = os.environ.get("KAGGLE_USER_SECRETS_TOKEN")
     print("KAGGLE_USER_SECRETS_TOKEN:", f"present, {len(jwt)} chars" if jwt else "ABSENT")
     for var in ("KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_URL", "KAGGLE_KERNEL_INTEGRATIONS",

@@ -58,14 +58,31 @@ Credentials come from `~/.kaggle/kaggle.json` or `KAGGLE_USERNAME` / `KAGGLE_KEY
 places the CLI reads. `kernel-metadata.json` is generated at push time rather than committed,
 because it carries a `<username>/<slug>` id that is wrong for anyone who forks this.
 
-**One manual step.** `HF_TOKEN` and `WANDB_API_KEY` have to be attached through Add-ons →
-Secrets on the kernel's editor page, once, after the first push. The API has no field for
-attaching secrets.
+**Tokens, once:**
 
-`HF_TOKEN` is the one that matters, and it needs write scope on the dataset repo. Without it
-the cache still loads, because reading a public dataset needs no token, but the chunk has
-nowhere to put its checkpoint and the session is a smoke test rather than a step of the run.
-Without `WANDB_API_KEY` the chunk trains and remains resumable; only the dashboard is lost.
+    export HF_TOKEN=...        # write scope on the dataset repo
+    export WANDB_API_KEY=...   # optional, curves only
+    python experiments/kabr/kaggle/submit.py secrets
+
+This puts them in a private dataset that every later push reattaches by itself.
+
+**Not Kaggle Secrets**, which do not survive this workflow. They are attached per kernel from
+the editor page, the save API has no field for them, and a push clears whatever was attached.
+Measured: with both attached by hand, the next push came back with
+`KAGGLE_KERNEL_INTEGRATIONS` empty, and a deliberately fake secret name returned the same
+HTTP 400 as the real ones — the service saying this kernel has nothing attached at all. Since
+every session is a push, that would be one trip to a web page per session, each of which
+silently costs a chunk when forgotten.
+
+Note that the mount path is not stable: the same dataset appears at
+`/kaggle/input/kabr-secrets/` on one kernel and `/kaggle/input/datasets/…` on another, with
+identical metadata. The session searches by file name at any depth for that reason.
+
+`HF_TOKEN` is the one that matters. Without it the cache still loads, because reading a
+public dataset needs no token, but the chunk has nowhere to put its checkpoint. The session
+checks for it in the first minute and stops rather than training for eleven hours and
+discarding the result. Without `WANDB_API_KEY` the chunk trains and stays resumable; only the
+dashboard is lost.
 
 The trainer proves it can write before it trains, with one small commit, rather than
 discovering an expired or read-only token at the end of the chunk when there is no time left

@@ -105,7 +105,9 @@ def arm_config(name: str, extra: list[str]):
 def visible_gpus() -> int:
     import torch
 
-    return torch.cuda.device_count()
+    # device_count can report a card on a host whose driver is in a state that makes it
+    # unusable, so both questions have to be asked.
+    return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
 def session(names: list[str], seconds: int, extra: list[str], skip_cache: bool = False) -> int:

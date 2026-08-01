@@ -23,6 +23,7 @@ Usage (KABR_HF_REPO overrides the default repo):
     python -m kabr.hf_sync ls
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -102,15 +103,21 @@ def pull_cache(cfg: Config) -> Path:
 
 
 # ---------------------------------------------------------------- runs
-def push_run(cfg: Config, all_checkpoints: bool = False) -> None:
+def push_run(cfg: Config, checkpoints: str = "none") -> None:
+    """Publish a run. Rolling checkpoints are excluded by default.
+
+    Resume does not come from here any more, it comes from the wandb artifact, so what this
+    publishes is the selected weights of a finished run rather than its resume state. A
+    rolling checkpoint is 570 MB of a step nobody chose.
+    """
     run_dir = cfg.run_dir
     if not run_dir.exists():
         raise SystemExit(f"no run at {run_dir}")
     latest = _latest_checkpoint(run_dir)
     patterns = list(RUN_KEEP)
-    if all_checkpoints:
+    if checkpoints == "all":
         patterns.append("ckpt-*.pt")
-    elif latest is not None:
+    elif checkpoints == "latest" and latest is not None:
         patterns.append(latest.name)
     print(f"uploading {run_dir.name} -> {repo_id()}:runs/{run_dir.name}")
     print(f"  patterns: {patterns}")
@@ -158,8 +165,8 @@ def main() -> None:
     known = argparse.ArgumentParser(add_help=False)
     known.add_argument("action", choices=["push-cache", "pull-cache", "push-run",
                                           "pull-run", "ls"])
-    known.add_argument("--all-checkpoints", action="store_true",
-                       help="push every rolling checkpoint, not just the newest")
+    known.add_argument("--checkpoints", choices=["none", "latest", "all"], default="none",
+                       help="rolling checkpoints to include when publishing a run")
     ns, rest = known.parse_known_args()
     if ns.action == "ls":
         return list_repo()
@@ -169,7 +176,7 @@ def main() -> None:
     elif ns.action == "pull-cache":
         pull_cache(cfg)
     elif ns.action == "push-run":
-        push_run(cfg, all_checkpoints=ns.all_checkpoints)
+        push_run(cfg, checkpoints=ns.checkpoints)
     else:
         pull_run(cfg)
 

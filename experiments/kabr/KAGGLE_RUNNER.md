@@ -92,6 +92,40 @@ Resubmitting continues the run rather than restarting it, because each arm runs 
 `--resume auto`. Checkpoints also go up every 2000 steps, not only at the end, so a session
 killed without warning loses a couple of hours rather than the whole chunk.
 
+## Letting the chain advance by itself
+
+The run is nine sessions long and a chunk ends whenever its eleven hours happen to be up,
+which is usually the middle of the night. `watch` does the resubmit:
+
+    tmux new -s kabr-watch
+    python experiments/kabr/kaggle/submit.py watch --chunks 6 | tee -a logs/watch.log
+
+It polls the kernel every five minutes and pushes the next chunk when the current one
+finishes. Leave it detached — it is the same `push` a person would run, in a loop, so
+killing it costs nothing but the automation.
+
+Two things it will not do, because an unattended loop with a GPU quota behind it has to fail
+towards spending nothing:
+
+- **Resubmit after a chunk that died young.** A chunk that ends in minutes ended for a reason
+  a resubmit will hit again — an expired token, a broken commit on the branch — and the loop
+  would spend the week rediscovering it. `--min-minutes 45` is the line. Past that there is
+  real training behind the failure, so it resumes from the last 2000-step checkpoint instead,
+  which is the right answer when Kaggle kills a chunk at hour ten.
+- **Run forever.** `--chunks` caps how many it launches. Six is about three weeks at the
+  30 h/week quota.
+
+It also refuses to believe a terminal status reported in the first fifteen minutes after its
+own push, because a push does not take effect instantly and the API still answers with the
+previous version's `COMPLETE` for a minute or so — long enough to push twice for one finished
+chunk. An unreadable status is retried rather than treated as a finish, and a push the API
+rejects (out of quota, most likely) stops the loop instead of retrying every five minutes.
+
+State lives in `logs/watch.log`: the state on every change and hourly regardless, so a `tail`
+answers "is it still watching" without attaching to the session. The decisions are tested
+against a fake clock in `experiments/kabr/test_submit_watch.py`, since neither failure shows
+up for eleven hours.
+
 ## The entry point
 
 `experiments/kabr/kaggle/kabr_session.py` is the whole kernel. It is plain Python with no

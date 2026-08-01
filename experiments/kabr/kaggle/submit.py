@@ -9,6 +9,13 @@ open. The cost is no live output, which is already covered because the run repor
     python experiments/kabr/kaggle/submit.py status
     python experiments/kabr/kaggle/submit.py output -o /tmp/kabr-kernel
 
+A run is a chain of chunks, and the chain only advances when the next one is pushed. `watch`
+does that push, so the run continues through a night rather than stopping at whichever hour
+the last chunk happened to end. It is a loop around the same `push` above, left running
+detached, and it stops rather than retrying when a chunk dies young - see `watch()`.
+
+    nohup python experiments/kabr/kaggle/submit.py watch --chunks 4 >> watch.log 2>&1 &
+
 `kernel-metadata.json` is generated rather than committed. It carries a `<username>/<slug>`
 id, and a stale one committed to a public repo is a paper cut for anyone who forks this and
 pushes to an id that is not theirs.
@@ -39,10 +46,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -203,10 +212,142 @@ def kaggle(*args: str) -> int:
     return subprocess.run(cmd).returncode
 
 
+def push(ns, overrides: dict[str, str], quiet: bool = False) -> int:
+    """Stage the entry script and submit it as a new version of the kernel.
+
+    A push is what continues the run: the chunk that starts finds its predecessor's
+    checkpoint on the hub and picks up from that step, so this is the same command whether
+    it is session one or session nine.
+    """
+    ref = f"{kaggle_username()}/{ns.slug}"
+    folder = stage(ns.slug, not ns.public, overrides)
+    if not quiet:
+        print(f"staged {folder}" + (f" with {overrides}" if overrides else ""))
+    code = kaggle("kernels", "push", "-p", str(folder),
+                  "--accelerator", ns.accelerator, "-t", str(ns.timeout))
+    shutil.rmtree(folder, ignore_errors=True)
+    if code == 0 and not quiet:
+        print(f"\npushed {ref}")
+        print(f"  https://www.kaggle.com/code/{ref}")
+        if not metadata(ns.slug, not ns.public)["dataset_sources"]:
+            print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
+            print(f"  fix it with: python {Path(__file__).name} secrets")
+        print(f"  watch it with: python {Path(__file__).name} status --slug {ns.slug}")
+    return code
+
+
+# %% ---------------------------------------------------------------- watch
+#
+# A chunk ends when its 11 hours are up, and the next one has to be pushed for the run to
+# continue. Doing that by hand costs a session every time it is missed overnight, and the
+# whole point of the chunking is that the run outlives the person watching it.
+
+# The states that mean "not finished yet". Anything else is terminal, including the several
+# spellings of cancelled, which is how a chunk that Kaggle killed comes back.
+WAITING = {"QUEUED", "RUNNING"}
+# Read back from a terminal chunk before believing it. A push does not take effect
+# instantly, so for a minute or so after one the API still reports the *previous* version's
+# terminal status - resubmitting on that would push twice for one finished chunk.
+SETTLE_SECONDS = 900
+
+
+def kernel_status(ref: str) -> tuple[str, str]:
+    """`(state, raw)`, with the state normalised to a bare upper-case word.
+
+    The CLI prints `... has status "KernelWorkerStatus.RUNNING"`, and the enum prefix has
+    not always been there across versions, so it is stripped rather than matched.
+    """
+    try:
+        out = subprocess.run(["kaggle", "kernels", "status", ref], capture_output=True,
+                             text=True, timeout=180)
+        raw = (out.stdout + out.stderr).strip()
+    except Exception as exc:
+        return "UNKNOWN", f"{type(exc).__name__}: {exc}"
+    if m := re.search(r'status "([^"]+)"', raw):
+        return m.group(1).rsplit(".", 1)[-1].upper(), raw
+    return "UNKNOWN", raw
+
+
+def watch(ns, overrides: dict[str, str]) -> None:
+    """Poll the kernel and push the next chunk when the current one finishes.
+
+    Meant to be left running detached - it is a loop around the same `push` that a person
+    would run, not a second way of submitting. Two things it refuses to do, because both
+    turn an unattended loop into a quota fire:
+
+    - Resubmit after a chunk that died young. A chunk that ends in minutes ended for a
+      reason a resubmit will hit again - a missing token, a bad commit on the branch - and
+      the loop would burn the week's hours rediscovering it. Anything past `--min-minutes`
+      has real training behind it, so a crash there is worth continuing from.
+    - Run forever. `--chunks` caps how many it will launch, so the worst case is bounded
+      even if something upstream starts failing in a way that looks like success.
+
+    A chunk killed mid-flight is still resubmitted, because the trainer pushes to the hub
+    every 2000 steps: the next chunk restarts from the last of those, not from zero.
+    """
+    ref = f"{kaggle_username()}/{ns.slug}"
+    def log(msg: str) -> None:
+        print(f"[{time.strftime('%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+    log(f"watching {ref}, will launch at most {ns.chunks} more chunk(s), "
+        f"polling every {ns.interval}s")
+    # The chunk already in flight was launched by hand, so its start time is unknown. It is
+    # exempt from the young-death check for that reason: at worst that costs one resubmit,
+    # which the check then catches on the round after.
+    started, launched, seen_waiting = None, 0, False
+    # A loop that prints nothing until something happens is indistinguishable from a loop
+    # that died, and this one is meant to be left alone overnight. Say the state on the
+    # first poll, whenever it changes, and hourly regardless, so `tail` answers "is it
+    # still watching" without attaching to anything.
+    last_state, last_note = None, 0.0
+    while True:
+        state, raw = kernel_status(ref)
+        if state != last_state or time.time() - last_note > 3600:
+            log(f"{state}" + (f", {(time.time() - started) / 60:.0f} min in" if started else ""))
+            last_state, last_note = state, time.time()
+        if state in WAITING:
+            seen_waiting = True
+            time.sleep(ns.interval)
+            continue
+        if state == "UNKNOWN":
+            # A blip in the network is not a reason to stop watching an 11 hour job.
+            log(f"  unreadable, retrying: {raw}")
+            time.sleep(ns.interval)
+            continue
+        if not seen_waiting and started is not None and time.time() - started < SETTLE_SECONDS:
+            time.sleep(ns.interval)
+            continue
+
+        ran = None if started is None else (time.time() - started) / 60
+        log(f"chunk finished: {state}" + (f" after {ran:.0f} min" if ran else ""))
+        if state != "COMPLETE":
+            # Verbatim, because this is where the weekly GPU quota running out will show up
+            # and nobody has seen what that looks like from here yet.
+            log(f"  {raw}")
+        if state != "COMPLETE" and ran is not None and ran < ns.min_minutes:
+            log(f"  it lasted under {ns.min_minutes} min, so this is a failure a resubmit "
+                f"would repeat rather than a chunk that ran out of clock. Stopping.")
+            log(f"  look at it with: python {Path(__file__).name} log --slug {ns.slug}")
+            return
+        if launched >= ns.chunks:
+            log(f"  reached the --chunks {ns.chunks} cap, stopping. "
+                f"Resubmit by hand or start another watch.")
+            return
+
+        log(f"pushing chunk {launched + 1}/{ns.chunks}")
+        if push(ns, overrides, quiet=True) != 0:
+            # Usually the weekly GPU quota, which no amount of retrying fixes today.
+            log("  push failed (quota? auth?), stopping so it does not spin.")
+            return
+        started, launched, seen_waiting = time.time(), launched + 1, False
+        log(f"  pushed, https://www.kaggle.com/code/{ref}")
+        time.sleep(ns.interval)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("action", choices=["push", "status", "output", "log", "metadata",
-                                       "secrets"])
+    ap.add_argument("action", choices=["push", "watch", "status", "output", "log",
+                                       "metadata", "secrets"])
     ap.add_argument("--slug", default=DEFAULT_SLUG)
     ap.add_argument("--accelerator", default="NvidiaTeslaT4",
                     help="NvidiaTeslaT4 or NvidiaTeslaP100")
@@ -215,6 +356,12 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="kaggle-output")
     ap.add_argument("--set", action="append", default=[], metavar="KABR_X=value",
                     help="override a KABR_* setting inside the kernel; repeatable")
+    ap.add_argument("--chunks", type=int, default=4,
+                    help="watch: how many further chunks to launch before stopping")
+    ap.add_argument("--interval", type=int, default=300,
+                    help="watch: seconds between status polls")
+    ap.add_argument("--min-minutes", type=int, default=45,
+                    help="watch: a failed chunk shorter than this stops the loop")
     ns = ap.parse_args()
 
     overrides = {}
@@ -235,19 +382,10 @@ def main() -> None:
     if ns.action in ("output", "log"):
         Path(ns.out).mkdir(parents=True, exist_ok=True)
         raise SystemExit(kaggle("kernels", "output", ref, "-p", ns.out))
+    if ns.action == "watch":
+        return watch(ns, overrides)
 
-    folder = stage(ns.slug, not ns.public, overrides)
-    print(f"staged {folder}" + (f" with {overrides}" if overrides else ""))
-    code = kaggle("kernels", "push", "-p", str(folder),
-                  "--accelerator", ns.accelerator, "-t", str(ns.timeout))
-    if code == 0:
-        print(f"\npushed {ref}")
-        print(f"  https://www.kaggle.com/code/{ref}")
-        if not metadata(ns.slug, not ns.public)["dataset_sources"]:
-            print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
-            print(f"  fix it with: python {Path(__file__).name} secrets")
-        print(f"  watch it with: python {Path(__file__).name} status --slug {ns.slug}")
-    raise SystemExit(code)
+    raise SystemExit(push(ns, overrides))
 
 
 if __name__ == "__main__":

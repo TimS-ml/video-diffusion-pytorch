@@ -98,9 +98,11 @@ if torch.cuda.is_available():
           f" -> amp_dtype auto picks {'bf16' if cap >= (8, 0) else 'fp16'}")
 
 # %%
-# Only what the Kaggle image does not already carry.
+# Only what the Kaggle image does not already carry. torch-fidelity is the one that is easy
+# to miss: torchmetrics is installed, but its FID and KID raise on construction without it,
+# and that happens inside the first metric block rather than at import.
 sh(sys.executable, "-m", "pip", "install", "-q",
-   "ema-pytorch", "rotary-embedding-torch", "einops-exts", "hf-transfer")
+   "ema-pytorch", "rotary-embedding-torch", "einops-exts", "hf-transfer", "torch-fidelity")
 
 # %%
 if not SRC.exists():

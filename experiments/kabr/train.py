@@ -1,4 +1,4 @@
-"""Training loop for unconditional KABR video diffusion.
+"""Training loop for KABR video diffusion, unconditional or behaviour conditioned.
 
 Three logging tiers, sized so evaluation stays a small fraction of training time:
 
@@ -6,10 +6,12 @@ Three logging tiers, sized so evaluation stays a small fraction of training time
   `eval_every`      deterministic held-out loss on a frozen set of (clip, t, noise)
                     triples, reported in epsilon and x0 space so the curve stays
                     comparable across objectives and loss weightings
-  `metric_every`    FVD / KVD / FID / KID, nearest-neighbour memorisation, diversity and
-                    motion statistics, from `metric_samples` DDIM samples
+  `metric_every`    FVD / KVD / FID / KID, nearest-neighbour memorisation, diversity,
+                    motion and optical-flow statistics, from `metric_samples` DDIM samples,
+                    plus a per-behaviour block when the run is conditioned
 
-Sampling uses the EMA weights, never the live ones.
+Sampling uses the EMA weights, never the live ones, and reuses one frozen set of latents at
+every checkpoint so two checkpoints differ by their weights and nothing else.
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ from torch.utils.data import DataLoader
 import wandb
 from kabr import metrics as M
 from kabr.config import Config, parse_config
-from kabr.data import KabrClips, cycle, deterministic_clips
+from kabr.data import (KabrClips, class_rows, cycle, deterministic_clips, make_cond_spec,
+                       window_conds)
 from video_diffusion_pytorch import GaussianDiffusion, Unet3D
 
 # einops rearranges change strides between shapes and blow past the default recompile
@@ -94,10 +97,18 @@ def grid_video(clips: torch.Tensor, rows: int, pad: int = 2) -> torch.Tensor:
 
 
 class FrozenEval:
-    """A fixed set of (clip, t, noise) triples, so the held-out curve has no sampling noise."""
+    """A fixed set of (clip, t, noise) triples, so the held-out curve has no sampling noise.
 
-    def __init__(self, clips: torch.Tensor, num_timesteps: int, n_t: int, seed: int):
+    Conditions are the ones the real clips carry, and guidance is off here: this measures
+    the denoiser, not the sampler, and a guidance scale would put the two on different
+    scales for no gain.
+    """
+
+    def __init__(self, clips: torch.Tensor, num_timesteps: int, n_t: int, seed: int,
+                 cond: torch.Tensor | None = None, device_type: str = "cuda"):
+        self.device_type = device_type
         self.clips = clips
+        self.cond = cond
         # stay away from both ends: recovering epsilon near t = 0 is ill conditioned
         frac = torch.linspace(0.1, 0.9, n_t)
         self.timesteps = (frac * (num_timesteps - 1)).long()
@@ -111,10 +122,11 @@ class FrozenEval:
             for i in range(0, len(self.clips), batch_size):
                 x0 = self.clips[i:i + batch_size].to(device) * 2 - 1
                 noise = self.noise[i:i + batch_size].to(device)
+                cond = None if self.cond is None else self.cond[i:i + batch_size].to(device)
                 t = torch.full((len(x0),), int(t_val), device=device, dtype=torch.long)
                 xt = diffusion.q_sample(x0, t, noise)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    pred_eps, pred_x0 = diffusion.model_predictions(xt, t)
+                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                    pred_eps, pred_x0 = diffusion.model_predictions(xt, t, cond=cond)
                 eps_se += F.mse_loss(pred_eps.float(), noise, reduction="sum").item()
                 x0_se += F.mse_loss(pred_x0.float(), x0, reduction="sum").item()
                 count += x0.numel()
@@ -126,9 +138,11 @@ class Trainer:
         self.cfg = cfg
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        self.device = "cuda"
+        self.device = cfg.resolve_device()
+        self.device_type = torch.device(self.device).type
+        if self.device_type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self.fps = round(29.97 / cfg.frame_stride)
 
         cfg.run_dir.mkdir(parents=True, exist_ok=True)
@@ -136,10 +150,13 @@ class Trainer:
         self.media_dir.mkdir(exist_ok=True)
         (cfg.run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2, default=str))
 
+        self.cond_spec = make_cond_spec(cfg)
+        cond_dim = self.cond_spec.dim if self.cond_spec else None
+
         self.unet = Unet3D(
             dim=cfg.dim, dim_mults=tuple(cfg.dim_mults),
             attn_heads=cfg.attn_heads, attn_dim_head=cfg.attn_dim_head,
-            use_bert_text_cond=False,
+            cond_dim=cond_dim, use_bert_text_cond=False,
         ).to(self.device)
 
         self.diffusion = GaussianDiffusion(
@@ -149,6 +166,7 @@ class Trainer:
             objective=cfg.objective,
             min_snr_loss_weight=cfg.min_snr_loss_weight, min_snr_gamma=cfg.min_snr_gamma,
             sampling_timesteps=cfg.sampling_timesteps, ddim_sampling_eta=cfg.ddim_sampling_eta,
+            schedule_shift=cfg.schedule_shift,
         ).to(self.device)
 
         self.ema = EMA(
@@ -156,27 +174,46 @@ class Trainer:
             update_every=cfg.ema_update_every, update_after_step=cfg.ema_update_after_step,
         ).to(self.device)
 
-        self.opt = torch.optim.Adam(self.unet.parameters(), lr=cfg.lr, betas=tuple(cfg.adam_betas))
+        # AdamW at weight_decay 0 is Adam, so the unconditional runs already on record stay
+        # reproducible through this call.
+        self.opt = torch.optim.AdamW(self.unet.parameters(), lr=cfg.lr,
+                                     betas=tuple(cfg.adam_betas), weight_decay=cfg.weight_decay)
 
         if cfg.compile_model:
             self.diffusion.denoise_fn = torch.compile(self.unet)
 
         ds = KabrClips(cfg.cache_dir, cfg.num_frames, cfg.frame_stride,
-                       split="train", horizontal_flip=cfg.horizontal_flip)
+                       split="train", horizontal_flip=cfg.horizontal_flip,
+                       cond_spec=self.cond_spec)
         self.dl = cycle(DataLoader(ds, batch_size=cfg.batch_size, shuffle=True,
                                    num_workers=cfg.num_workers, pin_memory=True,
                                    drop_last=True, persistent_workers=cfg.num_workers > 0))
         self.n_train_clips = len(ds)
 
+        # The marginal over conditions, read from the index alone so it is available before
+        # the first metric block loads anything onto the gpu.
+        self.cond_pool = (window_conds(cfg.cache_dir, cfg.num_frames, cfg.frame_stride,
+                                       "train", self.cond_spec)
+                          if self.cond_spec is not None else None)
+
         self.eval_sets = {}
         for split in ("train", "val"):
-            clips, _ = deterministic_clips(cfg.cache_dir, cfg.num_frames, cfg.frame_stride,
-                                           split, limit=cfg.eval_clips, seed=cfg.seed)
-            self.eval_sets[split] = FrozenEval(clips, cfg.timesteps, cfg.eval_timesteps, cfg.seed)
+            clips, _, cond = deterministic_clips(
+                cfg.cache_dir, cfg.num_frames, cfg.frame_stride, split,
+                limit=cfg.eval_clips, seed=cfg.seed, cond_spec=self.cond_spec)
+            self.eval_sets[split] = FrozenEval(clips, cfg.timesteps, cfg.eval_timesteps,
+                                               cfg.seed, cond=cond, device_type=self.device_type)
 
         self.i3d = None
         self.frame_metrics = None
+        self.flow = None
         self.ref = {}
+        self.class_ref: dict[int, torch.Tensor] = {}
+        self.metric_opts = M.MetricOptions(
+            batch_size=cfg.metric_batch, kvd_subsets=cfg.kvd_subsets,
+            kvd_subset_size=cfg.kvd_subset_size, flow_clips=cfg.flow_clips,
+            centre_frac=cfg.flow_centre_frac,
+        )
         self.step = 0
         self.best: dict[str, float] = {}
 
@@ -186,8 +223,10 @@ class Trainer:
             stale.unlink()
 
         self.params = sum(p.numel() for p in self.unet.parameters())
+        cond_note = "unconditional" if not self.cond_spec else \
+            f"cond dim {self.cond_spec.dim} ({', '.join(self.cond_spec.names())})"
         print(f"unet {self.params/1e6:.1f}M params | {self.n_train_clips} train mini-scenes "
-              f"| {self.fps} fps | run dir {cfg.run_dir}")
+              f"| {self.fps} fps | {cond_note} | run dir {cfg.run_dir}")
 
     # ---------------------------------------------------------------- metrics setup
     def _lazy_metric_setup(self):
@@ -196,28 +235,67 @@ class Trainer:
         cfg = self.cfg
         self.i3d = M.I3DFeatures(self.device)
         self.frame_metrics = M.FrameMetrics(self.device, kid_subset=min(128, cfg.metric_samples))
+        if cfg.flow_clips > 0:
+            self.flow = M.FlowMetrics(self.device, centre_frac=cfg.flow_centre_frac)
+        limit = cfg.metric_ref_samples or None
         for split in ("train", "val"):
-            clips, ids = deterministic_clips(cfg.cache_dir, cfg.num_frames, cfg.frame_stride,
-                                             split, limit=cfg.metric_samples, seed=cfg.metric_seed)
+            clips, ids, _ = deterministic_clips(
+                cfg.cache_dir, cfg.num_frames, cfg.frame_stride, split,
+                limit=limit, seed=cfg.metric_seed)
             self.ref[split] = clips
             self.ref[split + "_ids"] = ids
+            # The reference sets never change, so their features are computed once.
+            self.ref["f_" + split] = self.i3d(clips, cfg.metric_batch)
+        print(f"  metric references: {len(self.ref['train'])} train / {len(self.ref['val'])} val "
+              f"clips, I3D features cached")
+
+        if self.cond_spec is not None and cfg.metric_class_samples > 0:
+            rows = class_rows(cfg.cache_dir, cfg.num_frames, cfg.frame_stride, "train",
+                              pure_frac=cfg.cond_pure_frac)
+            for k, r in rows.items():
+                # A class needs at least a KVD subset worth of real clips before a distance
+                # against it says anything.
+                if len(r) < cfg.kvd_subset_size:
+                    continue
+                clips, _, _ = deterministic_clips(cfg.cache_dir, cfg.num_frames,
+                                                  cfg.frame_stride, "train", rows=r,
+                                                  limit=limit, seed=cfg.metric_seed)
+                self.class_ref[k] = self.i3d(clips, cfg.metric_batch)
+            names = [self.cond_spec.behaviours[k] for k in self.class_ref]
+            print(f"  per-class references: {dict(zip(names, (len(rows[k]) for k in self.class_ref)))}")
+
+    def _sample_conds(self, n: int, seed: int) -> torch.Tensor | None:
+        """Conditions for the metric block, drawn from the real training marginal.
+
+        Sampling every class uniformly would compare a flat generated distribution against a
+        reference that is 46% Head Up, and the distance would be measuring the mismatch we
+        introduced rather than the model.
+        """
+        if self.cond_spec is None:
+            return None
+        g = torch.Generator().manual_seed(seed)
+        return self.cond_pool[torch.randint(len(self.cond_pool), (n,), generator=g)]
 
     # ---------------------------------------------------------------- sampling
     @torch.no_grad()
-    def sample(self, n: int, steps: int | None = None) -> torch.Tensor:
+    def sample(self, n: int, steps: int | None = None, cond: torch.Tensor | None = None,
+               cond_scale: float | None = None) -> torch.Tensor:
         """DDIM samples from the EMA weights, on cpu, in [0, 1]."""
         live = self.diffusion.denoise_fn
         live_steps = self.diffusion.sampling_timesteps
         self.diffusion.denoise_fn = self.ema.ema_model
         if steps is not None:
             self.diffusion.sampling_timesteps = steps
+        scale = self.cfg.cond_scale if cond_scale is None else cond_scale
         try:
             out = []
             done = 0
             while done < n:
                 b = min(self.cfg.metric_batch, n - done)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    out.append(self.diffusion.sample(batch_size=b).float().cpu())
+                chunk = None if cond is None else cond[done:done + b].to(self.device)
+                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                    out.append(self.diffusion.sample(batch_size=b, cond=chunk,
+                                                     cond_scale=scale).float().cpu())
                 done += b
             return torch.cat(out)
         finally:
@@ -323,16 +401,24 @@ class Trainer:
         self._lazy_metric_setup()
         cfg = self.cfg
         self.diffusion.eval()
-        torch.manual_seed(cfg.metric_seed + self.step)
+        # With metric_fixed_noise the latents are the same tensor at every checkpoint, so a
+        # move in the metric is a move in the weights. It only holds while metric_batch is
+        # unchanged: the batching decides how the draws are cut, so a mid-run change to it
+        # breaks the pairing and the numbers before and after are independent samples again.
+        torch.manual_seed(cfg.metric_seed if cfg.metric_fixed_noise
+                          else cfg.metric_seed + self.step)
         t0 = time.time()
-        fake = self.sample(cfg.metric_samples)
+        fake = self.sample(cfg.metric_samples, cond=self._sample_conds(cfg.metric_samples,
+                                                                      cfg.metric_seed))
         gen_s = time.time() - t0
 
         scalars, extras = M.evaluate(
             fake, self.ref["train"], self.ref["val"], self.i3d,
-            self.frame_metrics, batch_size=cfg.metric_batch,
+            self.frame_metrics, opts=self.metric_opts, flow=self.flow,
+            f_train=self.ref["f_train"], f_val=self.ref["f_val"],
         )
         scalars["metric/gen_seconds"] = gen_s
+        scalars.update(self.run_class_metrics())
 
         # the eight generated clips closest to a training clip, paired with that clip:
         # the direct visual read on memorisation
@@ -352,10 +438,37 @@ class Trainer:
         self.diffusion.train()
         return scalars
 
+    def run_class_metrics(self) -> dict:
+        """KVD of clips generated for one behaviour against real clips of that behaviour.
+
+        This is the condition-consistency check. A conditional model can lower the overall
+        distance while ignoring the condition entirely; a per-class distance cannot be
+        satisfied that way, and it needs no behaviour classifier to compute.
+        """
+        cfg = self.cfg
+        if not self.class_ref or cfg.metric_class_samples <= 0:
+            return {}
+        out = {}
+        for k, ref_features in self.class_ref.items():
+            name = self.cond_spec.behaviours[k]
+            torch.manual_seed(cfg.metric_seed + k)
+            cond = self.cond_spec.one_hot(k).repeat(cfg.metric_class_samples, 1)
+            clips = self.sample(cfg.metric_class_samples, cond=cond)
+            features = self.i3d(clips, cfg.metric_batch)
+            kvd, _ = M.kernel_distance(features, ref_features, subsets=cfg.kvd_subsets,
+                                       subset_size=min(cfg.kvd_subset_size, len(clips)))
+            out[f"class/{name}_kvd"] = kvd
+            path = self.media_dir / f"class-{self.step:07d}-{name.replace(' ', '_')}.gif"
+            rows = max(1, int(math.isqrt(min(len(clips), 4))))
+            write_gif(grid_video(clips, rows), path, self.fps, scale=self.cfg.preview_scale)
+            out[f"class/{name}_samples"] = wandb.Video(str(path), format="gif",
+                                                       caption=f"{name} @ cfg {cfg.cond_scale}")
+        return out
+
     def log_samples(self) -> dict:
         n = self.cfg.sample_rows ** 2
         self.diffusion.eval()
-        clips = self.sample(n)
+        clips = self.sample(n, cond=self._sample_conds(n, self.cfg.metric_seed + 1))
         self.diffusion.train()
         path = self.media_dir / f"samples-{self.step:07d}.gif"
         write_gif(grid_video(clips, self.cfg.sample_rows), path, self.fps)
@@ -367,7 +480,8 @@ class Trainer:
         n = cfg.preview_rows ** 2
         self.diffusion.eval()
         t0 = time.time()
-        clips = self.sample(n, steps=cfg.preview_timesteps)
+        clips = self.sample(n, steps=cfg.preview_timesteps,
+                            cond=self._sample_conds(n, cfg.metric_seed + 2))
         self.diffusion.train()
 
         grid = self.media_dir / f"preview-{self.step:07d}-grid.gif"
@@ -423,9 +537,15 @@ class Trainer:
 
             total = 0.0
             for _ in range(cfg.grad_accum):
-                batch = next(self.dl).to(self.device, non_blocking=True)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = self.diffusion(batch)
+                batch = next(self.dl)
+                cond = None
+                if self.cond_spec is not None:
+                    batch, cond = batch
+                    cond = cond.to(self.device, non_blocking=True)
+                batch = batch.to(self.device, non_blocking=True)
+                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                    loss = self.diffusion(batch, cond=cond,
+                                          null_cond_prob=cfg.null_cond_prob)
                 (loss / cfg.grad_accum).backward()
                 total += loss.item() / cfg.grad_accum
 

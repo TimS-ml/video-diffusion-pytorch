@@ -14,10 +14,12 @@ Two choices define the architecture:
    spatial attention (sequence = h*w) or temporal attention (sequence = f) depending only
    on how the tensor was reshaped on the way in.
 
-`GaussianDiffusion` is close to textbook image DDPM: cosine beta schedule, epsilon
-prediction, full T-step ancestral sampling, no DDIM path. Its video-specific parts are the
-'b c f h w' shape check, classifier-free guidance over a BERT sentence embedding, and
-Imagen-style dynamic thresholding.
+`GaussianDiffusion` is close to textbook image DDPM: cosine beta schedule and epsilon
+prediction by default, with the parameterisation (`objective`), the loss weighting
+(`min_snr_loss_weight`), the sampler (`sampling_timesteps` selects DDIM) and the schedule
+position (`schedule_shift`) all available as opt-in arguments that default to the original
+behaviour. Its video-specific parts are the 'b c f h w' shape check, classifier-free
+guidance over the conditioning vector, and Imagen-style dynamic thresholding.
 """
 
 import math
@@ -500,8 +502,10 @@ class Unet3D(nn.Module):
       initial conv (`init_temporal_attn`).
     - Time is encoded twice inside temporal attention: a T5 relative position bias added
       to the logits, and rotary embeddings applied to q/k.
-    - `forward_with_cond_scale` implements classifier-free guidance over the text
-      embedding, and `focus_present_mask` can arrest temporal attention per sample.
+    - `forward_with_cond_scale` implements classifier-free guidance over the conditioning
+      vector, and `focus_present_mask` can arrest temporal attention per sample. The arrest
+      covers the stage and bottleneck layers but not `init_temporal_attn`, so a masked
+      sample is not a strictly per-frame image model.
     """
 
     def __init__(
@@ -739,13 +743,36 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.9999)
 
+def shift_alphas_cumprod(alphas_cumprod, shift):
+    """Move the whole schedule along the SNR axis by a constant factor.
+
+    A schedule is calibrated at one resolution. Neighbouring pixels of a natural image are
+    highly correlated, so averaging a k x k patch keeps the signal but divides the noise
+    variance by k^2: the information the network can actually use at a nominal t grows with
+    resolution, and the same t stops being as hard as it was. Global structure is decided in
+    the high-noise part of the chain, so a schedule that is too easy there lets the model
+    skip learning the global prior.
+
+    https://arxiv.org/abs/2301.10972 corrects for that with SNR' = SNR * shift^2, taking
+    shift = reference_resolution / resolution. In alpha_bar terms, with r = shift^2,
+
+        alpha_bar' = r * alpha_bar / (1 - alpha_bar + r * alpha_bar)
+
+    `shift < 1` (the case for training above the reference resolution) noises every step
+    harder. `shift == 1` returns the input unchanged.
+    """
+    if shift == 1.0:
+        return alphas_cumprod
+    r = shift ** 2
+    return r * alphas_cumprod / (1. - alphas_cumprod + r * alphas_cumprod)
+
 class GaussianDiffusion(nn.Module):
     """DDPM training objective and ancestral sampler, operating on (b, c, f, h, w) clips.
 
     Almost nothing in here is video-specific. The schedule buffers, the closed-form
     forward process, the posterior and the reverse loop are the same code you would write
-    for images; `extract` just broadcasts over two extra axes. There is no DDIM path, so
-    sampling always costs the full `timesteps` network evaluations.
+    for images; `extract` just broadcasts over two extra axes. Sampling costs the full
+    `timesteps` network evaluations unless `sampling_timesteps` selects the DDIM path.
 
     What matters for video is what is *not* per-frame: a clip draws one timestep t and one
     noise tensor, and the loss is taken over the whole clip at once, so the network has to
@@ -769,6 +796,10 @@ class GaussianDiffusion(nn.Module):
         sampling_timesteps: number of DDIM steps. `None` keeps the full T-step ancestral
             sampler, which is what `sample` used before DDIM existed here.
         ddim_sampling_eta: 0 is deterministic DDIM, 1 recovers the DDPM-like stochastic path.
+        schedule_shift: rescale the whole schedule by SNR' = SNR * schedule_shift^2, from
+            https://arxiv.org/abs/2301.10972. Set it to reference_resolution / resolution
+            when training above the resolution the cosine schedule was tuned at. 1 leaves
+            the schedule untouched.
 
     Every added argument defaults to the pre-existing behaviour, so a call site that does
     not pass them gets exactly the epsilon-prediction DDPM this class always was.
@@ -790,7 +821,8 @@ class GaussianDiffusion(nn.Module):
         min_snr_loss_weight = False,
         min_snr_gamma = 5.,
         sampling_timesteps = None,
-        ddim_sampling_eta = 0.
+        ddim_sampling_eta = 0.,
+        schedule_shift = 1.
     ):
         super().__init__()
         self.channels = channels
@@ -805,6 +837,18 @@ class GaussianDiffusion(nn.Module):
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
+
+        # alpha_bar is the authoritative quantity, so the shift is applied there and the
+        # per-step alphas and betas are re-derived from it. Guarded by the equality test so
+        # the default path keeps the exact float64 values it always had rather than a
+        # numerically equal round trip through a division.
+        assert schedule_shift > 0, f'schedule_shift must be positive, got {schedule_shift}'
+        self.schedule_shift = float(schedule_shift)
+        if self.schedule_shift != 1.0:
+            alphas_cumprod = shift_alphas_cumprod(alphas_cumprod, self.schedule_shift)
+            alphas = alphas_cumprod / F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+            betas = 1. - alphas
+
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
         timesteps, = betas.shape

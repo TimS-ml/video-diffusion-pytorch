@@ -89,6 +89,75 @@ def test_full_ancestral_still_default():
     print("[ok] sampling_timesteps=None keeps the full ancestral chain")
 
 
+def test_schedule_shift_is_identity_at_one():
+    """The default must reach the exact buffers it reached before the argument existed."""
+    a, b = make(), make(schedule_shift=1.0)
+    for name in ("betas", "alphas_cumprod", "posterior_variance", "loss_weight"):
+        assert torch.equal(getattr(a, name), getattr(b, name)), name
+    print("[ok] schedule_shift=1 leaves every schedule buffer bit-identical")
+
+
+def test_schedule_shift_scales_snr():
+    """SNR' = SNR * shift^2 at every timestep, which is the whole contract."""
+    shift = 64 / 96
+    base, shifted = make(), make(schedule_shift=shift)
+    snr = base.alphas_cumprod / (1 - base.alphas_cumprod)
+    want = snr * shift ** 2
+    got = shifted.alphas_cumprod / (1 - shifted.alphas_cumprod)
+    rel = ((got - want).abs() / want).max().item()
+    print(f"[ok] schedule_shift={shift:.4f} scales SNR by {shift**2:.4f}, max rel err {rel:.2e}")
+    # The buffers are float32 and the schedule is built in float64, so at the low-t end
+    # 1 - alpha_bar is a difference of order 1e-4 between numbers of order 1. That
+    # cancellation costs about four digits, which bounds what this comparison can resolve.
+    assert rel < 1e-3
+    # a smaller shift means more noise at the same nominal t
+    assert (shifted.alphas_cumprod < base.alphas_cumprod).all()
+
+
+def test_schedule_shift_keeps_alphas_consistent():
+    """alpha_bar must stay the cumulative product of 1 - beta after the shift."""
+    d = make(schedule_shift=0.5)
+    rebuilt = torch.cumprod(1 - d.betas.double(), dim=0)
+    err = (rebuilt - d.alphas_cumprod.double()).abs().max().item()
+    print(f"[ok] shifted betas still reproduce alpha_bar, max err {err:.2e}")
+    assert err < 1e-5
+    assert (d.betas >= 0).all() and (d.betas < 1).all()
+
+
+def make_cond(cond_dim=9, **kw):
+    torch.manual_seed(0)
+    u = Unet3D(dim=16, dim_mults=(1, 2), cond_dim=cond_dim)
+    return GaussianDiffusion(u, image_size=16, num_frames=4, timesteps=100, loss_type="l2", **kw)
+
+
+def test_conditional_loss_and_sample_shapes():
+    d = make_cond(objective="pred_v", sampling_timesteps=5)
+    x = torch.rand(2, 3, 4, 16, 16)
+    cond = torch.eye(9)[[0, 3]]
+    loss = d(x, cond=cond, null_cond_prob=0.1)
+    assert loss.isfinite()
+    with torch.no_grad():
+        out = d.sample(cond=cond, cond_scale=2.0)
+    assert out.shape == (2, 3, 4, 16, 16), out.shape
+    print(f"[ok] conditional loss={loss.item():.4f}, guided sample shape={tuple(out.shape)}")
+
+
+def test_guidance_scale_changes_the_prediction():
+    """cond_scale=1 must be the plain conditional pass, and a larger scale must differ."""
+    d = make_cond(objective="pred_v")
+    x = torch.randn(2, 3, 4, 16, 16)
+    t = torch.tensor([40, 40])
+    cond = torch.eye(9)[[1, 2]]
+    with torch.no_grad():
+        plain = d.denoise_fn(x, t, cond=cond, null_cond_prob=0.0)
+        one = d.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=1.0)
+        two = d.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=2.0)
+    assert torch.allclose(plain, one, atol=1e-6)
+    delta = (two - one).abs().max().item()
+    print(f"[ok] cond_scale=1 equals the conditional pass, scale=2 moves it by {delta:.4f}")
+    assert delta > 1e-4
+
+
 if __name__ == "__main__":
     test_default_loss_matches_plain_eps_mse()
     test_loss_weight_defaults_to_ones()
@@ -97,4 +166,9 @@ if __name__ == "__main__":
     test_model_predictions_consistent_across_objectives()
     test_ddim_shapes_and_range()
     test_full_ancestral_still_default()
+    test_schedule_shift_is_identity_at_one()
+    test_schedule_shift_scales_snr()
+    test_schedule_shift_keeps_alphas_consistent()
+    test_conditional_loss_and_sample_shapes()
+    test_guidance_scale_changes_the_prediction()
     print("\nall passed")

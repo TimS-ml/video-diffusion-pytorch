@@ -122,6 +122,34 @@ sh("git", "-C", SRC, "log", "--oneline", "-1")
 # %%
 from kaggle_secrets import UserSecretsClient
 
+# KABR_PROBE_SECRETS=1 answers "why did the secret not arrive" in one minute instead of one
+# session per hypothesis. The three causes look the same from the outside and need different
+# fixes: no JWT in the environment means the kernel was never granted secrets at all, a
+# reachable service that denies the name means it was not toggled on for this notebook, and
+# an unreachable service means neither and the problem is the network.
+if os.environ.get("KABR_PROBE_SECRETS") == "1":
+    import traceback
+    import urllib.request
+
+    print("KAGGLE_* present:", sorted(k for k in os.environ if "KAGGLE" in k.upper()))
+    jwt = os.environ.get("KAGGLE_USER_SECRETS_TOKEN")
+    print("KAGGLE_USER_SECRETS_TOKEN:", f"present, {len(jwt)} chars" if jwt else "ABSENT")
+    for var in ("KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_URL", "KAGGLE_IFRAME_HOST"):
+        print(f"  {var} = {os.environ.get(var)!r}")
+    for url in {"https://www.kaggle.com", os.environ.get("KAGGLE_URL_BASE", "")} - {""}:
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                print(f"  GET {url} -> {r.status}")
+        except Exception as exc:
+            print(f"  GET {url} -> {type(exc).__name__}: {exc}"
+                  f" | reason {getattr(exc, 'reason', None)!r}")
+    try:
+        UserSecretsClient().get_secret("HF_TOKEN")
+        print("  get_secret(HF_TOKEN) SUCCEEDED")
+    except Exception:
+        traceback.print_exc()
+    raise SystemExit("probe done")
+
 secrets = UserSecretsClient()
 
 

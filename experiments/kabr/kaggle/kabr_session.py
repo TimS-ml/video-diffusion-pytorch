@@ -134,7 +134,8 @@ if os.environ.get("KABR_PROBE_SECRETS") == "1":
     print("KAGGLE_* present:", sorted(k for k in os.environ if "KAGGLE" in k.upper()))
     jwt = os.environ.get("KAGGLE_USER_SECRETS_TOKEN")
     print("KAGGLE_USER_SECRETS_TOKEN:", f"present, {len(jwt)} chars" if jwt else "ABSENT")
-    for var in ("KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_URL", "KAGGLE_IFRAME_HOST"):
+    for var in ("KAGGLE_URL_BASE", "KAGGLE_DATA_PROXY_URL", "KAGGLE_KERNEL_INTEGRATIONS",
+                "KAGGLE_KERNEL_RUN_TYPE"):
         print(f"  {var} = {os.environ.get(var)!r}")
     for url in {"https://www.kaggle.com", os.environ.get("KAGGLE_URL_BASE", "")} - {""}:
         try:
@@ -143,11 +144,23 @@ if os.environ.get("KABR_PROBE_SECRETS") == "1":
         except Exception as exc:
             print(f"  GET {url} -> {type(exc).__name__}: {exc}"
                   f" | reason {getattr(exc, 'reason', None)!r}")
-    try:
-        UserSecretsClient().get_secret("HF_TOKEN")
-        print("  get_secret(HF_TOKEN) SUCCEEDED")
-    except Exception:
-        traceback.print_exc()
+    # The client turns every HTTP failure into the same ConnectionError, so the status and
+    # body - the only parts that say which of the three causes this is - survive on __cause__
+    # and nowhere else.
+    for label in ("HF_TOKEN", "WANDB_API_KEY", "DEFINITELY_NOT_A_REAL_SECRET"):
+        try:
+            UserSecretsClient().get_secret(label)
+            print(f"  get_secret({label}) SUCCEEDED")
+        except Exception as exc:
+            cause = exc.__cause__
+            body = ""
+            if hasattr(cause, "read"):
+                try:
+                    body = cause.read().decode()[:600]
+                except Exception:
+                    pass
+            print(f"  get_secret({label}) -> {type(exc).__name__}"
+                  f" | HTTP {getattr(cause, 'code', '?')} | body {body!r}")
     raise SystemExit("probe done")
 
 secrets = UserSecretsClient()

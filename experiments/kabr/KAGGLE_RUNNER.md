@@ -76,9 +76,10 @@ one GPU instead of two, the runner drops the extra arms rather than oversubscrib
 
 ## T4 specifics
 
-- **No bf16.** T4 is sm_75. `amp_dtype: auto` resolves to fp16 there and turns on the
-  gradient scaler with it. Pinning bf16 on this card is not an error in torch, it is a very
-  slow emulation.
+- **No bf16, and do not ask torch.** T4 is sm_75. `torch.cuda.is_bf16_supported()` answers
+  `True` on it, because it counts the software emulation path, so `amp_dtype: auto` reads the
+  compute capability instead: native bf16 arrives at sm_80. It resolves to fp16 here and
+  turns on the gradient scaler with it.
 - **fp16 overflows.** An fp16 forward pass can produce a non-finite loss and recover on the
   next step, so `nonfinite_patience` (default 10) decides how many consecutive ones end the
   run. Watch `train/loss_scale`: a scale that keeps collapsing means the model, not the
@@ -87,8 +88,15 @@ one GPU instead of two, the runner drops the extra arms rather than oversubscrib
   recorded runs.
 - **`torch.compile` is off** in the preset. A failed compile costs the whole session; turn it
   on once a session is known to work end to end.
-- **Throughput** is expected around 2.5-3 s/step, so an 11 hour chunk is on the order of 14k
-  steps and the 70k horizon is about five sessions per arm.
+- **Throughput, measured.** 3.58 s/step at 64px, batch 2 x accumulation 4, fp16, no compile
+  (226 steps in a 900 s chunk). The same 8 clips per step take 0.57 s on a 4090 running
+  eager, so a T4 is about 6x slower here — more than the 3.2x its memory bandwidth accounts
+  for, which is what makes `torch.compile` worth measuring rather than assuming.
+
+  That number sets the plan rather than decorating it. Scaling by pixel count, 96px lands
+  near 8 s/step, so an 11 hour chunk is roughly 5k steps and the step 40k the 96px baseline
+  peaked at is about 8 sessions per arm. Kaggle allows 30 GPU hours a week and two arms
+  share one session, so 96px to 40k is a three week plan and 64px to 40k is about one.
 
 ## Paths
 

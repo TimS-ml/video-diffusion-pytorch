@@ -88,8 +88,14 @@ import torch
 
 print("torch", torch.__version__, "| cuda", torch.version.cuda,
       "| devices", torch.cuda.device_count())
-print("bf16 supported:", torch.cuda.is_bf16_supported(),
-      "-> amp_dtype auto picks", "bf16" if torch.cuda.is_bf16_supported() else "fp16")
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability()
+    # `is_bf16_supported` says True on a T4 because it counts software emulation, which is
+    # the answer that would send this run onto the slow path. The capability is the one that
+    # decides, and it is printed next to the misleading answer on purpose.
+    print(f"sm_{cap[0]}{cap[1]} | native bf16 (sm_80+): {cap >= (8, 0)}"
+          f" | is_bf16_supported() says {torch.cuda.is_bf16_supported()}"
+          f" -> amp_dtype auto picks {'bf16' if cap >= (8, 0) else 'fp16'}")
 
 # %%
 # Only what the Kaggle image does not already carry.

@@ -38,15 +38,20 @@
 # - `HF_TOKEN` is optional, because the dataset holding the cache is public. It is only
 #   needed to write back to it.
 #
-# Secrets cannot be attached over the API, so the first push has to be followed by one visit
-# to the kernel's editor page.
+# The tokens arrive as a private dataset rather than as Kaggle Secrets. Secrets are attached
+# per kernel from the editor page, the save API has no field for them, and a push clears
+# whatever was attached, so in a workflow where every session is a push they are never there
+# when it counts. `submit.py secrets` puts them where a push can reattach them.
 
 # %%
+import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+SECRETS_FILE = "tokens.json"
 
 REPO = "https://github.com/TimS-ml/video-diffusion-pytorch"
 BRANCH = os.environ.get("KABR_BRANCH", "feature/kabr-conditioning")
@@ -166,18 +171,38 @@ if os.environ.get("KABR_PROBE_SECRETS") == "1":
 secrets = UserSecretsClient()
 
 
-def secret(name: str) -> str | None:
-    """Fetch a secret, reporting why it was not there.
+def from_dataset(name: str) -> str | None:
+    """The tokens as a private dataset, mounted read only under /kaggle/input.
 
-    The reason matters and they are not interchangeable: a secret that exists on the account
-    but was never toggled on for this kernel fails exactly like one that was never created,
-    and the fix is different. Swallowing the exception costs a session to rediscover.
+    This is the path that works. Kaggle Secrets are attached per kernel through the editor,
+    the save API has no field for them, and a push clears whatever was attached, so in a
+    workflow where every session is a push they are never there when it counts. A dataset
+    source is set by the same API that does the pushing, so it reattaches itself.
+
+    Globbed rather than named, so renaming the dataset does not silently stop this working.
+    """
+    for path in sorted(Path("/kaggle/input").glob(f"*/{SECRETS_FILE}")):
+        try:
+            if value := json.loads(path.read_text()).get(name):
+                print(f"  {name} from {path.parent.name}")
+                return value
+        except Exception as exc:
+            print(f"  {path}: {type(exc).__name__}: {exc}")
+    return None
+
+
+def secret(name: str) -> str | None:
+    """Kaggle Secrets first in case they are ever attached, then the dataset.
+
+    Reporting why a secret was not there, rather than swallowing it: "never created", "not
+    toggled on for this kernel" and "service unreachable" fail identically and need
+    different fixes, and each guess costs a session to rule out.
     """
     try:
         return secrets.get_secret(name)
     except Exception as exc:
         print(f"  secret {name}: {type(exc).__name__}: {exc}")
-        return None
+    return from_dataset(name)
 
 
 # HF_TOKEN is the one that decides whether this session is a step of the run or a smoke
@@ -201,10 +226,11 @@ if not token and os.environ.get("KABR_ALLOW_NO_TOKEN") != "1":
     raise SystemExit(
         "\nNo HF_TOKEN visible to this kernel, so the chunk would have nowhere to push its\n"
         "checkpoint and the whole session would be discarded. Stopping now instead.\n\n"
-        "Kaggle secrets are created once on the account but must be attached per kernel,\n"
-        "and there is no API for the attaching part. On this kernel's page:\n"
-        "  Add-ons -> Secrets -> toggle HF_TOKEN (and WANDB_API_KEY) on for THIS notebook\n"
-        "The token needs write scope on the dataset repo, not just read.\n\n"
+        "The tokens travel in a private dataset, because Kaggle Secrets do not survive a\n"
+        "push. From the machine that submits:\n"
+        "  export HF_TOKEN=...            # write scope on the dataset repo\n"
+        "  export WANDB_API_KEY=...       # optional, curves only\n"
+        "  python submit.py secrets\n\n"
         "To run without one anyway, as a throwaway smoke, set KABR_ALLOW_NO_TOKEN=1.")
 
 os.environ["KABR_OUT_ROOT"] = str(SCRATCH / "kabr_out")

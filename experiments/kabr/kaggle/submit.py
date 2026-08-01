@@ -16,9 +16,22 @@ pushes to an id that is not theirs.
 Credentials come from `~/.kaggle/kaggle.json` or `KAGGLE_USERNAME` / `KAGGLE_KEY`, the same
 places the CLI reads. Nothing is written into the repository.
 
-The one step that cannot be automated: `HF_TOKEN` and `WANDB_API_KEY` have to be attached to
-the kernel through Add-ons -> Secrets in its editor page, once, after the first push. The
-API has no field for it.
+Getting a token into the kernel does not go through Kaggle Secrets, because that does not
+survive this workflow. Secrets are attached per kernel through the editor page, the save API
+has no field for them, and pushing a new version clears whatever was attached: measured, by
+attaching them and watching `KAGGLE_KERNEL_INTEGRATIONS` come back empty on the next push. In
+a run that is nine sessions long and every session is a push, that is nine trips to a web
+page, each of which silently costs a chunk if forgotten.
+
+So the tokens travel in a private dataset instead. `dataset_sources` is a field the save API
+does control, so it reattaches itself on every push and there is nothing to remember:
+
+    export HF_TOKEN=...  WANDB_API_KEY=...
+    python submit.py secrets          # once, and again whenever a token is rotated
+
+The exposure is the same as a Kaggle secret - a private dataset only its owner can read - and
+neither the token nor the dataset ever enters the repository. Scope the HF token to just the
+one dataset repo it needs to write, so a leak costs a revoke and nothing else.
 """
 
 from __future__ import annotations
@@ -35,6 +48,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "kabr_session.py"
 DEFAULT_SLUG = "kabr-video-diffusion-session"
+
+# A private dataset holding the tokens, mounted read-only at /kaggle/input/<slug>/.
+SECRETS_DATASET = "kabr-secrets"
+SECRETS_FILE = "tokens.json"
+# WANDB_API_KEY is optional: without it a chunk still trains and still saves, it just does
+# not draw. HF_TOKEN is not, because it is what makes the session's work survive it.
+SECRET_NAMES = ("HF_TOKEN", "WANDB_API_KEY")
 
 
 def kaggle_username() -> str:
@@ -73,7 +93,20 @@ def kaggle_username() -> str:
         f"kaggle.json), or set KAGGLE_USERNAME to skip the lookup")
 
 
+def dataset_exists(ref: str) -> bool:
+    try:
+        return subprocess.run(["kaggle", "datasets", "files", ref], capture_output=True,
+                              timeout=60).returncode == 0
+    except Exception:
+        return False
+
+
 def metadata(slug: str, private: bool) -> dict:
+    # Attached here rather than through the editor, because this field survives a push and
+    # an Add-ons -> Secrets toggle does not. Left out when it does not exist yet, so that a
+    # fork that has never run `secrets` can still push.
+    secrets_ref = f"{kaggle_username()}/{SECRETS_DATASET}"
+    sources = [secrets_ref] if dataset_exists(secrets_ref) else []
     return {
         "id": f"{kaggle_username()}/{slug}",
         "title": slug,
@@ -85,10 +118,43 @@ def metadata(slug: str, private: bool) -> dict:
         "is_private": private,
         "enable_gpu": True,
         "enable_internet": True,
-        "dataset_sources": [],
+        "dataset_sources": sources,
         "competition_sources": [],
         "kernel_sources": [],
     }
+
+
+def push_secrets() -> None:
+    """Put the tokens in a private dataset, reading them from this shell's environment.
+
+    Never from a file in the repository, and the staging directory is removed even if the
+    upload fails, so the only copies are the one in the environment and the one on Kaggle.
+    """
+    values = {name: os.environ[name] for name in SECRET_NAMES if os.environ.get(name)}
+    if "HF_TOKEN" not in values:
+        raise SystemExit(
+            "HF_TOKEN is not set in this shell, and it is the one that matters: without it a\n"
+            "session trains for its full length and then has nowhere to put the result.\n"
+            "  export HF_TOKEN=...        # write scope on the dataset repo\n"
+            "  export WANDB_API_KEY=...   # optional, curves only")
+    ref = f"{kaggle_username()}/{SECRETS_DATASET}"
+    folder = Path(tempfile.mkdtemp(prefix="kabr-secrets-"))
+    try:
+        (folder / SECRETS_FILE).write_text(json.dumps(values, indent=2) + "\n")
+        (folder / "dataset-metadata.json").write_text(json.dumps(
+            {"title": SECRETS_DATASET, "id": ref, "licenses": [{"name": "other"}]},
+            indent=2) + "\n")
+        print(f"uploading {sorted(values)} to {ref} (private)")
+        if dataset_exists(ref):
+            code = kaggle("datasets", "version", "-p", str(folder), "-m", "rotate tokens")
+        else:
+            code = kaggle("datasets", "create", "-p", str(folder))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if code != 0:
+        raise SystemExit(code)
+    print(f"\n{ref} holds {sorted(values)}")
+    print("  it attaches itself to every push from now on, nothing to click")
 
 
 def with_overrides(source: str, overrides: dict[str, str]) -> str:
@@ -139,7 +205,8 @@ def kaggle(*args: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("action", choices=["push", "status", "output", "log", "metadata"])
+    ap.add_argument("action", choices=["push", "status", "output", "log", "metadata",
+                                       "secrets"])
     ap.add_argument("--slug", default=DEFAULT_SLUG)
     ap.add_argument("--accelerator", default="NvidiaTeslaT4",
                     help="NvidiaTeslaT4 or NvidiaTeslaP100")
@@ -158,6 +225,8 @@ def main() -> None:
         overrides[key] = value
 
     ref = f"{kaggle_username()}/{ns.slug}"
+    if ns.action == "secrets":
+        return push_secrets()
     if ns.action == "metadata":
         print(json.dumps(metadata(ns.slug, not ns.public), indent=2))
         return
@@ -174,8 +243,9 @@ def main() -> None:
     if code == 0:
         print(f"\npushed {ref}")
         print(f"  https://www.kaggle.com/code/{ref}")
-        print("  first push only: open that page and attach HF_TOKEN and WANDB_API_KEY "
-              "under Add-ons -> Secrets, then push again")
+        if not metadata(ns.slug, not ns.public)["dataset_sources"]:
+            print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
+            print(f"  fix it with: python {Path(__file__).name} secrets")
         print(f"  watch it with: python {Path(__file__).name} status --slug {ns.slug}")
     raise SystemExit(code)
 

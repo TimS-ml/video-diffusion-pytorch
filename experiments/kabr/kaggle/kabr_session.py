@@ -31,9 +31,15 @@
 # - the checkpoints are per run and only mean anything next to the curves that produced
 #   them, so they are wandb artifacts
 #
-# The kernel needs `HF_TOKEN` and `WANDB_API_KEY` attached under Add-ons -> Secrets, and
-# Internet enabled. Secrets cannot be attached over the API, so the first push has to be
-# followed by one visit to the kernel's editor page.
+# Internet has to be on. Of the two secrets, only one actually gates anything:
+#
+# - `WANDB_API_KEY` is required. Without it the chunk trains and then has nowhere to leave
+#   its checkpoint, so it cannot be resumed from and the session is a smoke test.
+# - `HF_TOKEN` is optional, because the dataset holding the cache is public. It is only
+#   needed to write back to it.
+#
+# Secrets cannot be attached over the API, so the first push has to be followed by one visit
+# to the kernel's editor page.
 
 # %%
 import os
@@ -54,6 +60,10 @@ SCRATCH = Path("/kaggle/temp")
 CHUNK_SECONDS = int(os.environ.get("KABR_CHUNK_SECONDS", 39_600))  # 11 h
 ARMS = os.environ.get("KABR_ARMS", "conditioned,control")
 IMAGE_SIZE = int(os.environ.get("KABR_IMAGE_SIZE", 96))
+# Forwarded verbatim to every arm. A short smoke session wants the expensive blocks pulled
+# forward - the metric block is where a 16 GB card is most likely to run out of memory, and
+# a chunk that never reaches one has not tested the thing most likely to fail.
+EXTRA = os.environ.get("KABR_EXTRA", "").split()
 
 
 def sh(*args, **kw):
@@ -103,14 +113,29 @@ sh("git", "-C", SRC, "log", "--oneline", "-1")
 from kaggle_secrets import UserSecretsClient
 
 secrets = UserSecretsClient()
-os.environ["HF_TOKEN"] = secrets.get_secret("HF_TOKEN")
-try:
-    os.environ["WANDB_API_KEY"] = secrets.get_secret("WANDB_API_KEY")
-except Exception:
+
+
+def secret(name: str) -> str | None:
+    try:
+        return secrets.get_secret(name)
+    except Exception:
+        return None
+
+
+# Reading the cache off a public dataset needs no token, so a missing HF_TOKEN is only a
+# problem for writing back, which this session does not do.
+if token := secret("HF_TOKEN"):
+    os.environ["HF_TOKEN"] = token
+else:
+    print("no HF_TOKEN secret: public reads still work, pushing to the dataset will not")
+
+if key := secret("WANDB_API_KEY"):
+    os.environ["WANDB_API_KEY"] = key
+else:
     # Without wandb there is nowhere to put the checkpoint, so the chunk cannot be resumed
     # from and the session is a smoke test rather than a step of the run.
     os.environ["WANDB_MODE"] = "offline"
-    print("no WANDB_API_KEY secret: logging offline, this chunk will not be resumable")
+    print("no WANDB_API_KEY secret: logging offline, THIS CHUNK WILL NOT BE RESUMABLE")
 
 os.environ["KABR_OUT_ROOT"] = str(SCRATCH / "kabr_out")
 os.environ["KABR_HF_REPO"] = os.environ.get("KABR_HF_REPO", "TimS-ml/kabr-video-diffusion")
@@ -157,7 +182,8 @@ print("cache version", idx.version,
 # %%
 rc = subprocess.run(
     [sys.executable, "-u", "-m", "kabr.kaggle_runner",
-     "--arms", ARMS, "--seconds", str(CHUNK_SECONDS), "--image-size", str(IMAGE_SIZE)],
+     "--arms", ARMS, "--seconds", str(CHUNK_SECONDS), "--image-size", str(IMAGE_SIZE),
+     *EXTRA],
     cwd=str(SRC), env=os.environ.copy(),
 ).returncode
 print("session exit", rc, flush=True)
@@ -174,7 +200,7 @@ from kabr import wandb_sync
 from kabr.kaggle_runner import arm_config
 
 for arm in ARMS.split(","):
-    arm_cfg = arm_config(arm, ["--image-size", str(IMAGE_SIZE)])
+    arm_cfg = arm_config(arm, ["--image-size", str(IMAGE_SIZE), *EXTRA])
     print(f"{arm}: artifact {wandb_sync.artifact_name(arm_cfg)}"
           f" | local {wandb_sync.latest_local(arm_cfg.run_dir)}")
 

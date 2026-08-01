@@ -38,15 +38,32 @@ DEFAULT_SLUG = "kabr-video-diffusion-session"
 
 
 def kaggle_username() -> str:
-    for key in ("KAGGLE_USERNAME",):
-        if os.environ.get(key):
-            return os.environ[key]
-    cfg = Path(os.environ.get("KAGGLE_CONFIG_DIR", Path.home() / ".kaggle")) / "kaggle.json"
+    """Whoever the CLI is authenticated as, whichever of the three ways that happened.
+
+    There are two credential formats in circulation: the older `kaggle.json` holding a
+    username and key, and an access token, which carries the identity without spelling it
+    out. `kaggle config view` reports the resolved username under either, so it is the
+    fallback rather than the first thing tried - it costs a subprocess.
+    """
+    if os.environ.get("KAGGLE_USERNAME"):
+        return os.environ["KAGGLE_USERNAME"]
+    cfg_dir = Path(os.environ.get("KAGGLE_CONFIG_DIR", Path.home() / ".kaggle"))
+    cfg = cfg_dir / "kaggle.json"
     if cfg.exists():
         return json.loads(cfg.read_text())["username"]
+    try:
+        out = subprocess.run(["kaggle", "config", "view"], capture_output=True, text=True,
+                             check=True, timeout=60).stdout
+        for line in out.splitlines():
+            if line.strip().startswith("- username:"):
+                name = line.split(":", 1)[1].strip()
+                if name and name != "None":
+                    return name
+    except Exception:
+        pass
     raise SystemExit(
-        "no Kaggle credentials: put kaggle.json in ~/.kaggle or set "
-        "KAGGLE_USERNAME and KAGGLE_KEY")
+        f"cannot resolve a Kaggle username. Authenticate the CLI (an access token at "
+        f"{cfg_dir / 'access_token'}, or kaggle.json), or set KAGGLE_USERNAME")
 
 
 def metadata(slug: str, private: bool) -> dict:
@@ -67,7 +84,33 @@ def metadata(slug: str, private: bool) -> dict:
     }
 
 
-def stage(slug: str, private: bool) -> Path:
+def with_overrides(source: str, overrides: dict[str, str]) -> str:
+    """Inject `KABR_*` settings into the staged copy of the entry script.
+
+    A kernel has no environment to set from the outside and a script kernel is one file, so
+    the settings have to travel inside it. `setdefault` rather than assignment, so a real
+    environment variable still wins if one ever exists.
+
+    The block goes after the jupytext header rather than at the top of the file, which keeps
+    the staged copy parseable as a notebook for anyone who downloads the kernel.
+    """
+    if not overrides:
+        return source
+    block = ["import os as _os  # injected by submit.py"]
+    block += [f"_os.environ.setdefault({k!r}, {v!r})" for k, v in overrides.items()]
+    injected = "\n".join(block) + "\n"
+
+    lines = source.splitlines(keepends=True)
+    end = 0
+    if lines and lines[0].startswith("# ---"):
+        for i, line in enumerate(lines[1:], start=1):
+            if line.startswith("# ---"):
+                end = i + 1
+                break
+    return "".join(lines[:end]) + "\n" + injected + "".join(lines[end:])
+
+
+def stage(slug: str, private: bool, overrides: dict[str, str]) -> Path:
     """Build the upload folder: the entry script and nothing else.
 
     Only the entry point is uploaded. It clones the repository at a branch, so the code that
@@ -75,7 +118,7 @@ def stage(slug: str, private: bool) -> Path:
     readable.
     """
     folder = Path(tempfile.mkdtemp(prefix="kabr-kernel-"))
-    shutil.copy2(ENTRY, folder / ENTRY.name)
+    (folder / ENTRY.name).write_text(with_overrides(ENTRY.read_text(), overrides))
     (folder / "kernel-metadata.json").write_text(
         json.dumps(metadata(slug, private), indent=2) + "\n")
     return folder
@@ -96,7 +139,16 @@ def main() -> None:
     ap.add_argument("--timeout", type=int, default=43_200, help="kernel wall clock cap")
     ap.add_argument("--public", action="store_true", help="push as a public kernel")
     ap.add_argument("-o", "--out", default="kaggle-output")
+    ap.add_argument("--set", action="append", default=[], metavar="KABR_X=value",
+                    help="override a KABR_* setting inside the kernel; repeatable")
     ns = ap.parse_args()
+
+    overrides = {}
+    for item in ns.set:
+        key, _, value = item.partition("=")
+        if not _ or not key.startswith("KABR_"):
+            raise SystemExit(f"--set wants KABR_KEY=value, got {item!r}")
+        overrides[key] = value
 
     ref = f"{kaggle_username()}/{ns.slug}"
     if ns.action == "metadata":
@@ -108,8 +160,8 @@ def main() -> None:
         Path(ns.out).mkdir(parents=True, exist_ok=True)
         raise SystemExit(kaggle("kernels", "output", ref, "-p", ns.out))
 
-    folder = stage(ns.slug, not ns.public)
-    print(f"staged {folder}")
+    folder = stage(ns.slug, not ns.public, overrides)
+    print(f"staged {folder}" + (f" with {overrides}" if overrides else ""))
     code = kaggle("kernels", "push", "-p", str(folder),
                   "--accelerator", ns.accelerator, "-t", str(ns.timeout))
     if code == 0:

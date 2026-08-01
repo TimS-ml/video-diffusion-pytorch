@@ -53,12 +53,12 @@ BRANCH = os.environ.get("KABR_BRANCH", "feature/kabr-conditioning")
 # Everything under /kaggle/working is saved as kernel output, and `kernels output` then
 # downloads it file by file. The cache is 4 GB, each checkpoint is 570 MB and a git clone is
 # a few thousand small files, so all three go to scratch instead. What is worth keeping from
-# a session is the log and the wandb artifact.
+# a session is the log and the chunk pushed to the dataset repo.
 SCRATCH = Path("/kaggle/temp")
 SRC = SCRATCH / "video-diffusion-pytorch"
 
 # A batch kernel is cut at 12 hours. Stop the chunk early enough to write a checkpoint and
-# push it as an artifact, which is the only thing that survives the session.
+# push it to the hub, which is the only thing that survives the session.
 CHUNK_SECONDS = int(os.environ.get("KABR_CHUNK_SECONDS", 39_600))  # 11 h
 ARMS = os.environ.get("KABR_ARMS", "conditioned,control")
 IMAGE_SIZE = int(os.environ.get("KABR_IMAGE_SIZE", 96))
@@ -126,9 +126,16 @@ secrets = UserSecretsClient()
 
 
 def secret(name: str) -> str | None:
+    """Fetch a secret, reporting why it was not there.
+
+    The reason matters and they are not interchangeable: a secret that exists on the account
+    but was never toggled on for this kernel fails exactly like one that was never created,
+    and the fix is different. Swallowing the exception costs a session to rediscover.
+    """
     try:
         return secrets.get_secret(name)
-    except Exception:
+    except Exception as exc:
+        print(f"  secret {name}: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -137,8 +144,6 @@ def secret(name: str) -> str | None:
 # does, and that checkpoint is the only thing the session leaves behind.
 if token := secret("HF_TOKEN"):
     os.environ["HF_TOKEN"] = token
-else:
-    print("no HF_TOKEN secret: the cache still loads, but THIS CHUNK WILL NOT BE RESUMABLE")
 
 # wandb holds the curves, not the resume state, so a missing key costs the dashboard rather
 # than the training. Offline runs still write their logs into the run directory.
@@ -147,6 +152,19 @@ if key := secret("WANDB_API_KEY"):
 else:
     os.environ["WANDB_MODE"] = "offline"
     print("no WANDB_API_KEY secret: logging offline, curves will not appear on the dashboard")
+
+# Stop here rather than 11 hours from here. Without a write token the session trains
+# perfectly well and then throws all of it away, which is the most expensive way this can
+# fail and the one that looks most like success while it is happening.
+if not token and os.environ.get("KABR_ALLOW_NO_TOKEN") != "1":
+    raise SystemExit(
+        "\nNo HF_TOKEN visible to this kernel, so the chunk would have nowhere to push its\n"
+        "checkpoint and the whole session would be discarded. Stopping now instead.\n\n"
+        "Kaggle secrets are created once on the account but must be attached per kernel,\n"
+        "and there is no API for the attaching part. On this kernel's page:\n"
+        "  Add-ons -> Secrets -> toggle HF_TOKEN (and WANDB_API_KEY) on for THIS notebook\n"
+        "The token needs write scope on the dataset repo, not just read.\n\n"
+        "To run without one anyway, as a throwaway smoke, set KABR_ALLOW_NO_TOKEN=1.")
 
 os.environ["KABR_OUT_ROOT"] = str(SCRATCH / "kabr_out")
 os.environ["KABR_HF_REPO"] = os.environ.get("KABR_HF_REPO", "TimS-ml/kabr-video-diffusion")

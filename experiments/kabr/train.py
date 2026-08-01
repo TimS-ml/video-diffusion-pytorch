@@ -32,14 +32,21 @@ from torch.utils.data import DataLoader
 
 import wandb
 from kabr import metrics as M
+from kabr import wandb_sync
 from kabr.config import Config, parse_config
 from kabr.data import (KabrClips, class_rows, cycle, deterministic_clips, make_cond_spec,
                        window_conds)
 from video_diffusion_pytorch import GaussianDiffusion, Unet3D
 
 # einops rearranges change strides between shapes and blow past the default recompile
-# budget; the graphs themselves are small so a higher ceiling is cheap.
-torch._dynamo.config.recompile_limit = 64
+# budget; the graphs themselves are small so a higher ceiling is cheap. The knob was called
+# cache_size_limit before torch 2.7, and a rented or hosted runtime is not always on the
+# version this was written against.
+for _name in ("recompile_limit", "cache_size_limit"):
+    if hasattr(torch._dynamo.config, _name):
+        setattr(torch._dynamo.config, _name, 64)
+
+AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
 def git_sha() -> str:
@@ -105,8 +112,10 @@ class FrozenEval:
     """
 
     def __init__(self, clips: torch.Tensor, num_timesteps: int, n_t: int, seed: int,
-                 cond: torch.Tensor | None = None, device_type: str = "cuda"):
+                 cond: torch.Tensor | None = None, device_type: str = "cuda",
+                 amp: dict | None = None):
         self.device_type = device_type
+        self.amp = amp or {"dtype": torch.bfloat16, "enabled": True}
         self.clips = clips
         self.cond = cond
         # stay away from both ends: recovering epsilon near t = 0 is ill conditioned
@@ -125,7 +134,7 @@ class FrozenEval:
                 cond = None if self.cond is None else self.cond[i:i + batch_size].to(device)
                 t = torch.full((len(x0),), int(t_val), device=device, dtype=torch.long)
                 xt = diffusion.q_sample(x0, t, noise)
-                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                with torch.autocast(self.device_type, **self.amp):
                     pred_eps, pred_x0 = diffusion.model_predictions(xt, t, cond=cond)
                 eps_se += F.mse_loss(pred_eps.float(), noise, reduction="sum").item()
                 x0_se += F.mse_loss(pred_x0.float(), x0, reduction="sum").item()
@@ -143,6 +152,12 @@ class Trainer:
         if self.device_type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        amp_name, amp_on = cfg.resolve_amp()
+        self.amp_name = amp_name
+        self.amp = {"dtype": AMP_DTYPES[amp_name], "enabled": amp_on}
+        # Only fp16 needs the scaler; at bf16 or fp32 it is constructed disabled and every
+        # call below becomes a pass-through, so there is one code path rather than two.
+        self.scaler = torch.amp.GradScaler(self.device_type, enabled=(amp_name == "fp16"))
         self.fps = round(29.97 / cfg.frame_stride)
 
         cfg.run_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +217,8 @@ class Trainer:
                 cfg.cache_dir, cfg.num_frames, cfg.frame_stride, split,
                 limit=cfg.eval_clips, seed=cfg.seed, cond_spec=self.cond_spec)
             self.eval_sets[split] = FrozenEval(clips, cfg.timesteps, cfg.eval_timesteps,
-                                               cfg.seed, cond=cond, device_type=self.device_type)
+                                               cfg.seed, cond=cond, device_type=self.device_type,
+                                               amp=self.amp)
 
         self.i3d = None
         self.frame_metrics = None
@@ -226,7 +242,8 @@ class Trainer:
         cond_note = "unconditional" if not self.cond_spec else \
             f"cond dim {self.cond_spec.dim} ({', '.join(self.cond_spec.names())})"
         print(f"unet {self.params/1e6:.1f}M params | {self.n_train_clips} train mini-scenes "
-              f"| {self.fps} fps | {cond_note} | run dir {cfg.run_dir}")
+              f"| {self.fps} fps | {cond_note} | {self.device} {self.amp_name} "
+              f"| run dir {cfg.run_dir}")
 
     # ---------------------------------------------------------------- metrics setup
     def _lazy_metric_setup(self):
@@ -293,7 +310,7 @@ class Trainer:
             while done < n:
                 b = min(self.cfg.metric_batch, n - done)
                 chunk = None if cond is None else cond[done:done + b].to(self.device)
-                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                with torch.autocast(self.device_type, **self.amp):
                     out.append(self.diffusion.sample(batch_size=b, cond=chunk,
                                                      cond_scale=scale).float().cpu())
                 done += b
@@ -309,6 +326,7 @@ class Trainer:
             "unet": self.unet.state_dict(),
             "ema": self.ema.state_dict(),
             "opt": self.opt.state_dict(),
+            "scaler": self.scaler.state_dict(),
             "config": self.cfg.to_dict(),
             "best": self.best,
         }
@@ -370,6 +388,10 @@ class Trainer:
         self.unet.load_state_dict(blob["unet"])
         self.ema.load_state_dict(blob["ema"])
         self.opt.load_state_dict(blob["opt"])
+        # Absent in checkpoints written before fp16 was reachable, and absent in any run
+        # that used bf16, where the scaler carries no state worth restoring.
+        if blob.get("scaler") and self.scaler.is_enabled():
+            self.scaler.load_state_dict(blob["scaler"])
         self.step = blob["step"]
         # Carry the record over, otherwise the first eval after a resume always looks like a
         # new best and overwrites a genuinely better checkpoint.
@@ -510,11 +532,12 @@ class Trainer:
         else:
             run_id = wandb.util.generate_id()
             id_file.write_text(run_id)
-        wandb.init(
+        run = wandb.init(
             project=cfg.wandb_project, name=cfg.run_name, mode=cfg.wandb_mode,
             id=run_id, resume="allow",
             config={**cfg.to_dict(), "params": self.params, "git_sha": git_sha(),
-                    "train_clips": self.n_train_clips, "fps": self.fps},
+                    "train_clips": self.n_train_clips, "fps": self.fps,
+                    "resolved_device": self.device, "resolved_amp": self.amp_name},
             dir=str(cfg.run_dir),
         )
         # A resume restarts from the last checkpoint, which is up to ckpt_every steps
@@ -529,6 +552,7 @@ class Trainer:
         t_last = time.time()
         t_start = time.time()
         stop_reason = "train_steps"
+        nonfinite = 0
 
         while self.step < cfg.train_steps:
             lr = lr_at(self.step, cfg)
@@ -543,24 +567,38 @@ class Trainer:
                     batch, cond = batch
                     cond = cond.to(self.device, non_blocking=True)
                 batch = batch.to(self.device, non_blocking=True)
-                with torch.autocast(self.device_type, dtype=torch.bfloat16):
+                with torch.autocast(self.device_type, **self.amp):
                     loss = self.diffusion(batch, cond=cond,
                                           null_cond_prob=cfg.null_cond_prob)
-                (loss / cfg.grad_accum).backward()
+                self.scaler.scale(loss / cfg.grad_accum).backward()
                 total += loss.item() / cfg.grad_accum
 
+            # Unscale before clipping, or the clip threshold is applied to gradients that
+            # are still multiplied by the loss scale and the norm means nothing.
+            self.scaler.unscale_(self.opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.unet.parameters(), cfg.max_grad_norm)
-            self.opt.step()
+            self.scaler.step(self.opt)
+            self.scaler.update()
             self.opt.zero_grad(set_to_none=True)
             self.ema.update()
             self.step += 1
 
-            if not math.isfinite(total):
-                raise RuntimeError(f"loss went non-finite at step {self.step}")
+            if math.isfinite(total):
+                nonfinite = 0
+            else:
+                nonfinite += 1
+                print(f"  non-finite loss at step {self.step} "
+                      f"({nonfinite}/{cfg.nonfinite_patience})", flush=True)
+                if nonfinite >= cfg.nonfinite_patience:
+                    raise RuntimeError(
+                        f"loss non-finite for {nonfinite} consecutive steps ending at "
+                        f"{self.step}")
 
             log = {"train/global_step": self.step,
                    "train/loss": total, "train/lr": lr,
                    "train/grad_norm": float(grad_norm),
+                   "train/nonfinite_streak": nonfinite,
+                   "train/loss_scale": float(self.scaler.get_scale()) if self.scaler.is_enabled() else 1.0,
                    "train/step_seconds": time.time() - t_last,
                    "train/clips_seen": self.step * cfg.batch_size * cfg.grad_accum,
                    "train/epochs": self.step * cfg.batch_size * cfg.grad_accum / self.n_train_clips}
@@ -581,7 +619,11 @@ class Trainer:
             # new best.
             log.update(self.save_best(log))
             if self.step % cfg.ckpt_every == 0:
-                self.save(str(self.step))
+                path = self.save(str(self.step))
+                if cfg.ckpt_artifact and cfg.ckpt_artifact_every \
+                        and self.step % cfg.ckpt_artifact_every == 0:
+                    wandb_sync.push_checkpoint(cfg, run, path, self.step,
+                                               {"reason": "milestone"})
 
             wandb.log(log)
             if self.step % 100 == 0:
@@ -601,7 +643,15 @@ class Trainer:
         # out of wall clock saves under its step number instead, so the next chunk resumes
         # from it and nothing downstream mistakes a partial run for a finished one.
         done = self.step >= cfg.train_steps
-        self.save("final" if done else str(self.step))
+        path = self.save("final" if done else str(self.step))
+        # After the save and before finish: this artifact is the only thing a session that
+        # is about to be reclaimed leaves behind.
+        if cfg.ckpt_artifact:
+            try:
+                wandb_sync.push_checkpoint(cfg, run, path, self.step,
+                                           {"reason": stop_reason, "done": done})
+            except Exception as exc:
+                print(f"artifact push failed: {type(exc).__name__}: {exc}", flush=True)
         wandb.finish()
         print(f"KABR_STATUS {json.dumps({'step': self.step, 'done': done, 'reason': stop_reason, 'train_steps': cfg.train_steps})}",
               flush=True)
@@ -610,9 +660,12 @@ class Trainer:
 
 def main():
     cfg = parse_config()
+    # Before the Trainer, because "auto" restores wandb_id.txt and the best-*.pt record into
+    # the run directory, and both have to be there before training rather than after.
+    resume = wandb_sync.resolve_resume(cfg)
     trainer = Trainer(cfg)
-    if cfg.resume:
-        trainer.load(cfg.resume)
+    if resume:
+        trainer.load(resume)
     trainer.train()
 
 

@@ -5,9 +5,10 @@
 #   ./utils/run.sh python -m kabr.train --train-steps 300000
 #
 # Required in the environment (never hardcoded in the repo):
-#   KABR_DATA_ROOT  dataset root, the directory holding image/
 #   KABR_OUT_ROOT   writable output root for cache/, runs/
 # Optional:
+#   KABR_DATA_ROOT  dataset root, the directory holding image/. Only `prepare_data` decodes
+#                   the JPEGs; a machine that pulls a prepared cache never needs this.
 #   KABR_GPU        PCI bus index of the GPU to use (default 0)
 set -euo pipefail
 
@@ -16,7 +17,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exp_root="${repo_root}/experiments"
 
-: "${KABR_DATA_ROOT:?set KABR_DATA_ROOT to the KABR dataset root}"
 : "${KABR_OUT_ROOT:?set KABR_OUT_ROOT to a writable output directory}"
 
 # The conda-provided libstdc++ has to win over the system one, or importing torchvision

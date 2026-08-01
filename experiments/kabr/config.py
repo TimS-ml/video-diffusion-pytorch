@@ -105,6 +105,14 @@ class Config:
     # pipeline be exercised on a machine with no working gpu, which is the difference
     # between verifying a change and asserting that it looks right.
     device: str = "auto"
+    # bf16 needs sm_80. A T4 is sm_75, so on that card "auto" resolves to fp16 and the
+    # gradient scaler turns on with it; without the scaler an fp16 run silently flushes
+    # small gradients to zero. Pinning bf16 on a card that cannot do it is not an error in
+    # torch, it is a very slow emulation, which is why this resolves rather than defaults.
+    amp_dtype: str = "auto"  # auto | bf16 | fp16 | fp32
+    # An fp16 forward pass can overflow into a non-finite loss and recover on the next
+    # step. One such step is not a broken run; ten in a row is.
+    nonfinite_patience: int = 10
 
     # A rented GPU is billed by the hour and its scheduler kills the container at a fixed
     # timeout, so a long run has to be cut into chunks that each stop on their own terms and
@@ -188,15 +196,24 @@ class Config:
     wandb_mode: str = "online"
     data_root: str = ""
     out_root: str = ""
+    # A path, or "auto" to take the newest wandb checkpoint artifact for this run name and
+    # fall back to whatever is already on disk. "auto" is what a hosted session wants: it
+    # starts with an empty disk and has to find its own previous chunk.
     resume: str = ""
+    # Log the checkpoint as a wandb artifact at the end of every chunk, and every
+    # `ckpt_artifact_every` steps if that is set. Artifact storage is content addressed, so
+    # the best-*.pt files that did not change cost nothing to include again.
+    ckpt_artifact: bool = False
+    ckpt_artifact_every: int = 0
 
     def __post_init__(self):
         if not self.data_root:
             self.data_root = os.environ.get("KABR_DATA_ROOT", "")
         if not self.out_root:
             self.out_root = os.environ.get("KABR_OUT_ROOT", "")
-        if not self.data_root:
-            raise SystemExit("set KABR_DATA_ROOT (or pass --data-root) to the KABR dataset root")
+        # data_root is only needed to decode the JPEGs, which happens once. A session that
+        # pulls a prepared cache never sees the raw dataset, so this is checked where it is
+        # used rather than here.
         if not self.out_root:
             raise SystemExit("set KABR_OUT_ROOT (or pass --out-root) to a writable output dir")
         unknown = [s for s in self.species_list if s not in SPECIES_PREFIX]
@@ -221,6 +238,20 @@ class Config:
         import torch
         return "cuda" if torch.cuda.is_available() else "cpu"
 
+    def resolve_amp(self) -> tuple[str, bool]:
+        """(dtype name, autocast enabled) for the device this run will land on."""
+        import torch
+
+        if self.amp_dtype == "fp32":
+            return "fp32", False
+        if self.amp_dtype in ("bf16", "fp16"):
+            return self.amp_dtype, True
+        if self.amp_dtype != "auto":
+            raise SystemExit(f"amp_dtype must be auto, bf16, fp16 or fp32, got {self.amp_dtype!r}")
+        if self.resolve_device().startswith("cuda"):
+            return ("bf16" if torch.cuda.is_bf16_supported() else "fp16"), True
+        return "bf16", True
+
     # ---- derived paths ----------------------------------------------------
     @property
     def species_list(self) -> tuple[str, ...]:
@@ -239,6 +270,8 @@ class Config:
 
     @property
     def image_dir(self) -> Path:
+        if not self.data_root:
+            raise SystemExit("set KABR_DATA_ROOT (or pass --data-root) to the KABR dataset root")
         return Path(self.data_root) / "image"
 
     @property

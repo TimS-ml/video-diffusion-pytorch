@@ -193,7 +193,10 @@ class Config:
     # ---- bookkeeping ------------------------------------------------------
     run_name: str = ""
     wandb_project: str = "kabr-video-diffusion"
-    wandb_mode: str = "online"
+    # Passed straight to `wandb.init`, where it overrides the WANDB_MODE environment
+    # variable rather than deferring to it. Defaulting from the environment is what makes
+    # `WANDB_MODE=offline` mean what it says; an explicit --wandb-mode still wins.
+    wandb_mode: str = ""
     data_root: str = ""
     out_root: str = ""
     # A path, or "auto" to take the newest wandb checkpoint artifact for this run name and
@@ -211,6 +214,8 @@ class Config:
             self.data_root = os.environ.get("KABR_DATA_ROOT", "")
         if not self.out_root:
             self.out_root = os.environ.get("KABR_OUT_ROOT", "")
+        if not self.wandb_mode:
+            self.wandb_mode = os.environ.get("WANDB_MODE", "online")
         # data_root is only needed to decode the JPEGs, which happens once. A session that
         # pulls a prepared cache never sees the raw dataset, so this is checked where it is
         # used rather than here.
@@ -249,7 +254,11 @@ class Config:
         if self.amp_dtype != "auto":
             raise SystemExit(f"amp_dtype must be auto, bf16, fp16 or fp32, got {self.amp_dtype!r}")
         if self.resolve_device().startswith("cuda"):
-            return ("bf16" if torch.cuda.is_bf16_supported() else "fp16"), True
+            # Not `is_bf16_supported()`: it answers True on a T4, because it counts the
+            # software emulation path, and that answer sends training onto exactly the slow
+            # path the question was asked to avoid. Native bf16 arrives with sm_80.
+            major, minor = torch.cuda.get_device_capability()
+            return ("bf16" if (major, minor) >= (8, 0) else "fp16"), True
         return "bf16", True
 
     # ---- derived paths ----------------------------------------------------

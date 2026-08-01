@@ -50,10 +50,12 @@ from pathlib import Path
 
 REPO = "https://github.com/TimS-ml/video-diffusion-pytorch"
 BRANCH = os.environ.get("KABR_BRANCH", "feature/kabr-conditioning")
-SRC = Path("/kaggle/working/video-diffusion-pytorch")
-# Everything under /kaggle/working is saved as kernel output. The cache is 4 GB and each
-# checkpoint is 570 MB, and both already have a home elsewhere, so they go to scratch.
+# Everything under /kaggle/working is saved as kernel output, and `kernels output` then
+# downloads it file by file. The cache is 4 GB, each checkpoint is 570 MB and a git clone is
+# a few thousand small files, so all three go to scratch instead. What is worth keeping from
+# a session is the log and the wandb artifact.
 SCRATCH = Path("/kaggle/temp")
+SRC = SCRATCH / "video-diffusion-pytorch"
 
 # A batch kernel is cut at 12 hours. Stop the chunk early enough to write a checkpoint and
 # push it as an artifact, which is the only thing that survives the session.

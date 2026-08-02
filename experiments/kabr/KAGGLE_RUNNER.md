@@ -92,6 +92,19 @@ Resubmitting continues the run rather than restarting it, because each arm runs 
 `--resume auto`. Checkpoints also go up every 2000 steps, not only at the end, so a session
 killed without warning loses a couple of hours rather than the whole chunk.
 
+## A run that says "crashed" every 2000 steps has not crashed
+
+The checkpoint push blocks the training loop, and the wandb heartbeat stops with it, so wandb
+relabels the run `crashed` and then `running` again when the push returns. Measured on both
+arms, at every multiple of 2000: an 11 minute silence on the conditioned arm, 7 on the
+control, and training continues from the next step as if nothing happened.
+
+Read the step history rather than the state before believing an arm died. The tell is that
+the last logged step is a multiple of 2000 minus one or two; a real death lands anywhere. The
+push also costs about 6% of a session, and the two arms overlap their uploads and slow each
+other down — pushing off the training thread would buy back roughly half a session over the
+nine, and has not been done.
+
 ## Letting the chain advance by itself
 
 The run is nine sessions long and a chunk ends whenever its eleven hours happen to be up,

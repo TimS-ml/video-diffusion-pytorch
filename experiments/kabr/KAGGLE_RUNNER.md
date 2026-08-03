@@ -117,27 +117,37 @@ It polls the kernel every five minutes and pushes the next chunk when the curren
 finishes. Leave it detached — it is the same `push` a person would run, in a loop, so
 killing it costs nothing but the automation.
 
-Two things it will not do, because an unattended loop with a GPU quota behind it has to fail
-towards spending nothing:
+Three things it will not do, because an unattended loop with a GPU quota behind it has to
+fail towards spending nothing:
 
 - **Resubmit after a chunk that died young.** A chunk that ends in minutes ended for a reason
   a resubmit will hit again — an expired token, a broken commit on the branch — and the loop
   would spend the week rediscovering it. `--min-minutes 45` is the line. Past that there is
   real training behind the failure, so it resumes from the last 2000-step checkpoint instead,
   which is the right answer when Kaggle kills a chunk at hour ten.
-- **Run forever.** `--chunks` caps how many it launches. Six is about three weeks at the
-  30 h/week quota.
+- **Act on one terminal reading.** The status API is stale for a while right after this
+  loop's own push (a push takes a minute or so to take effect, and the API answers with the
+  *previous* version's `COMPLETE` until it does), and separately — measured once, hours
+  outside that window — just wrong: it reported `COMPLETE` for four minutes solid while the
+  kernel kept logging steps to wandb without a break. A second read after a short pause is
+  what catches both; only a `COMPLETE` that holds on re-poll is believed.
+- **Give up on a quota rejection.** `kaggle kernels push` returns exit code 0 even when
+  Kaggle rejects the push for quota — measured, the CLI printed `Kernel push error: Maximum
+  weekly GPU quota of 30.00 hours reached.` and still exited clean. The first version of this
+  loop trusted the exit code, logged four rejected pushes as four successful ones, and burned
+  its `--chunks` budget doing nothing. `push()` now reads the rejection out of the text
+  instead. A quota rejection specifically is not stopped on — it is not a failure that
+  resolves by retrying today, but it does resolve on its own at the weekly reset, so the loop
+  backs off half an hour and tries again rather than needing a person to notice and restart
+  it. Any other rejection (auth, a malformed kernel) still stops the loop, because that one
+  does not fix itself.
 
-It also refuses to believe a terminal status reported in the first fifteen minutes after its
-own push, because a push does not take effect instantly and the API still answers with the
-previous version's `COMPLETE` for a minute or so — long enough to push twice for one finished
-chunk. An unreadable status is retried rather than treated as a finish, and a push the API
-rejects (out of quota, most likely) stops the loop instead of retrying every five minutes.
-
-State lives in `logs/watch.log`: the state on every change and hourly regardless, so a `tail`
-answers "is it still watching" without attaching to the session. The decisions are tested
-against a fake clock in `experiments/kabr/test_submit_watch.py`, since neither failure shows
-up for eleven hours.
+`--chunks` caps how many chunks it actually *launches* — a quota backoff does not count
+against it, since it launched nothing. State lives in `logs/watch.log`: the state on every
+change and hourly regardless, so a `tail` answers "is it still watching" without attaching to
+the session. The decisions are tested against a fake clock in
+`experiments/kabr/test_submit_watch.py`, since none of these failures show up for eleven
+hours.
 
 ## The entry point
 

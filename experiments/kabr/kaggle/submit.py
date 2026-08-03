@@ -206,34 +206,49 @@ def stage(slug: str, private: bool, overrides: dict[str, str]) -> Path:
     return folder
 
 
-def kaggle(*args: str) -> int:
+def kaggle(*args: str) -> tuple[int, str]:
     cmd = ["kaggle", *args]
     print("$", " ".join(cmd), flush=True)
-    return subprocess.run(cmd).returncode
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    text = out.stdout + out.stderr
+    print(text, end="" if text.endswith("\n") else "\n", flush=True)
+    return out.returncode, text
 
 
-def push(ns, overrides: dict[str, str], quiet: bool = False) -> int:
+def push(ns, overrides: dict[str, str], quiet: bool = False) -> str | None:
     """Stage the entry script and submit it as a new version of the kernel.
 
     A push is what continues the run: the chunk that starts finds its predecessor's
     checkpoint on the hub and picks up from that step, so this is the same command whether
     it is session one or session nine.
+
+    Returns `None` on success, or the failure text otherwise. Not an exit code, because
+    `kaggle kernels push` returns 0 even when Kaggle rejects the push - "Kernel push error:
+    Maximum weekly GPU quota of 30.00 hours reached." comes back on an exit code of 0, and a
+    caller that only checked the code would log four of these as four successful pushes,
+    which is exactly what happened the first time this ran unattended. The rejection has to
+    be read out of the text instead, so `push -> "successfully pushed"` is what is trusted
+    rather than the process's own opinion of whether it worked.
     """
     ref = f"{kaggle_username()}/{ns.slug}"
     folder = stage(ns.slug, not ns.public, overrides)
     if not quiet:
         print(f"staged {folder}" + (f" with {overrides}" if overrides else ""))
-    code = kaggle("kernels", "push", "-p", str(folder),
-                  "--accelerator", ns.accelerator, "-t", str(ns.timeout))
+    code, text = kaggle("kernels", "push", "-p", str(folder),
+                        "--accelerator", ns.accelerator, "-t", str(ns.timeout))
     shutil.rmtree(folder, ignore_errors=True)
-    if code == 0 and not quiet:
+    if code != 0:
+        return text.strip() or f"exit {code}"
+    if "successfully pushed" not in text.lower():
+        return text.strip() or "no confirmation in kaggle's output"
+    if not quiet:
         print(f"\npushed {ref}")
         print(f"  https://www.kaggle.com/code/{ref}")
         if not metadata(ns.slug, not ns.public)["dataset_sources"]:
             print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
             print(f"  fix it with: python {Path(__file__).name} secrets")
         print(f"  watch it with: python {Path(__file__).name} status --slug {ns.slug}")
-    return code
+    return None
 
 
 # %% ---------------------------------------------------------------- watch
@@ -249,6 +264,18 @@ WAITING = {"QUEUED", "RUNNING"}
 # instantly, so for a minute or so after one the API still reports the *previous* version's
 # terminal status - resubmitting on that would push twice for one finished chunk.
 SETTLE_SECONDS = 900
+# A second reason not to act on the first terminal read: the status API is not only stale
+# right after a push, it is occasionally just wrong. Measured once, well outside the settle
+# window - it reported COMPLETE for four minutes straight while training kept logging to
+# wandb without a break, so a chunk that was hours from done looked finished. One re-poll
+# after a short pause is what a person would do before believing it, and it costs one poll.
+RECONFIRM_SECONDS = 90
+# How long to wait before trying a push again after Kaggle rejects one for quota. This is
+# not a failure the loop should give up on - the quota is weekly and resolves on its own -
+# so it backs off and keeps trying rather than needing to be started by hand again once the
+# week turns over. Coarser than the training poll interval because there is nothing to
+# learn by asking again in five minutes.
+QUOTA_RETRY_SECONDS = 1800
 
 
 def kernel_status(ref: str) -> tuple[str, str]:
@@ -272,15 +299,26 @@ def watch(ns, overrides: dict[str, str]) -> None:
     """Poll the kernel and push the next chunk when the current one finishes.
 
     Meant to be left running detached - it is a loop around the same `push` that a person
-    would run, not a second way of submitting. Two things it refuses to do, because both
-    turn an unattended loop into a quota fire:
+    would run, not a second way of submitting. Three things it refuses to do, because all
+    three turn an unattended loop into either a quota fire or a run that quietly stopped:
 
     - Resubmit after a chunk that died young. A chunk that ends in minutes ended for a
       reason a resubmit will hit again - a missing token, a bad commit on the branch - and
       the loop would burn the week's hours rediscovering it. Anything past `--min-minutes`
       has real training behind it, so a crash there is worth continuing from.
-    - Run forever. `--chunks` caps how many it will launch, so the worst case is bounded
-      even if something upstream starts failing in a way that looks like success.
+    - Act on one terminal reading. The status API is stale for a while right after this
+      loop's own push (`SETTLE_SECONDS`), and separately - measured once - just wrong:
+      COMPLETE for four minutes while the kernel kept training. A second read after a short
+      pause is what catches both.
+    - Give up on a quota rejection. It is not a failure that a resubmit fixes today, but it
+      is not a failure at all next week, so this backs off and keeps trying rather than
+      needing a person to notice and restart it once the quota turns over. A rejection for
+      any other reason - auth, a malformed kernel - does stop the loop, because retrying
+      that one is pure waste.
+
+    `--chunks` still caps how many chunks it will actually launch, so the worst case if
+    something upstream starts failing in a way that looks like success stays bounded. Quota
+    backoffs do not count against the cap, since they launch nothing.
 
     A chunk killed mid-flight is still resubmitted, because the trainer pushes to the hub
     every 2000 steps: the next chunk restarts from the last of those, not from zero.
@@ -318,6 +356,17 @@ def watch(ns, overrides: dict[str, str]) -> None:
             time.sleep(ns.interval)
             continue
 
+        # One terminal reading is not enough to act on - re-poll after a short pause and
+        # only proceed if it is still terminal. Anything that comes back WAITING here was
+        # the flaky case, and the outer loop treats it exactly like any other still-running
+        # chunk from that point.
+        time.sleep(RECONFIRM_SECONDS)
+        confirm_state, confirm_raw = kernel_status(ref)
+        if confirm_state in WAITING or confirm_state == "UNKNOWN":
+            log(f"  {state} did not hold on re-poll ({confirm_state}); still watching")
+            continue
+        state, raw = confirm_state, confirm_raw
+
         ran = None if started is None else (time.time() - started) / 60
         log(f"chunk finished: {state}" + (f" after {ran:.0f} min" if ran else ""))
         if state != "COMPLETE":
@@ -335,9 +384,15 @@ def watch(ns, overrides: dict[str, str]) -> None:
             return
 
         log(f"pushing chunk {launched + 1}/{ns.chunks}")
-        if push(ns, overrides, quiet=True) != 0:
-            # Usually the weekly GPU quota, which no amount of retrying fixes today.
-            log("  push failed (quota? auth?), stopping so it does not spin.")
+        failure = push(ns, overrides, quiet=True)
+        if failure and "quota" in failure.lower():
+            log(f"  {failure}")
+            log(f"  weekly quota, not a bug - retrying in {QUOTA_RETRY_SECONDS // 60} min "
+                f"rather than giving up on the run")
+            time.sleep(QUOTA_RETRY_SECONDS)
+            continue
+        if failure:
+            log(f"  push rejected, stopping so it does not spin: {failure}")
             return
         started, launched, seen_waiting = time.time(), launched + 1, False
         log(f"  pushed, https://www.kaggle.com/code/{ref}")
@@ -378,14 +433,17 @@ def main() -> None:
         print(json.dumps(metadata(ns.slug, not ns.public), indent=2))
         return
     if ns.action == "status":
-        raise SystemExit(kaggle("kernels", "status", ref))
+        raise SystemExit(kaggle("kernels", "status", ref)[0])
     if ns.action in ("output", "log"):
         Path(ns.out).mkdir(parents=True, exist_ok=True)
-        raise SystemExit(kaggle("kernels", "output", ref, "-p", ns.out))
+        raise SystemExit(kaggle("kernels", "output", ref, "-p", ns.out)[0])
     if ns.action == "watch":
         return watch(ns, overrides)
 
-    raise SystemExit(push(ns, overrides))
+    failure = push(ns, overrides)
+    if failure:
+        print(f"\npush rejected:\n{failure}")
+    raise SystemExit(1 if failure else 0)
 
 
 if __name__ == "__main__":

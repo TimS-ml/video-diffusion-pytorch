@@ -102,20 +102,51 @@ def kaggle_username() -> str:
         f"kaggle.json), or set KAGGLE_USERNAME to skip the lookup")
 
 
-def dataset_exists(ref: str) -> bool:
-    try:
-        return subprocess.run(["kaggle", "datasets", "files", ref], capture_output=True,
-                              timeout=60).returncode == 0
-    except Exception:
-        return False
+class SecretsUnverified(RuntimeError):
+    """The secrets dataset could not be confirmed present, which is not the same as absent."""
 
 
-def metadata(slug: str, private: bool) -> dict:
+def dataset_exists(ref: str, attempts: int = 3, pause: float = 20.0) -> bool:
+    """Whether the dataset is readable. Raises `SecretsUnverified` if that is not knowable.
+
+    Kaggle answers a bare `403 Client Error: Forbidden` both for a dataset that does not
+    exist and for one this credential is not currently allowed to read - measured, by asking
+    for a dataset that was definitely never created and getting a response identical to the
+    one a lapsed token gets for a dataset that definitely does. Nothing in the reply
+    distinguishes them, so a failed probe means "could not tell" rather than "not there".
+
+    That distinction is the whole point. The caller uses this to decide whether to attach the
+    token dataset, and reading a transient failure as absence attaches nothing: the kernel
+    then trains with no `HF_TOKEN`, stops itself at minute one by design, and the watch loop
+    sees a chunk that died young and stops for the night. Retrying first, then refusing to
+    guess, turns that into a delayed push instead of a lost session.
+    """
+    for attempt in range(attempts):
+        try:
+            out = subprocess.run(["kaggle", "datasets", "files", ref], capture_output=True,
+                                 text=True, timeout=60)
+            if out.returncode == 0:
+                return True
+            problem = (out.stdout + out.stderr).strip() or f"exit {out.returncode}"
+        except Exception as exc:
+            problem = f"{type(exc).__name__}: {exc}"
+        if attempt + 1 < attempts:
+            time.sleep(pause)
+    raise SecretsUnverified(
+        f"could not confirm whether {ref} exists after {attempts} attempts: {problem}")
+
+
+def metadata(slug: str, private: bool, allow_missing_secrets: bool = False) -> dict:
     # Attached here rather than through the editor, because this field survives a push and
-    # an Add-ons -> Secrets toggle does not. Left out when it does not exist yet, so that a
-    # fork that has never run `secrets` can still push.
+    # an Add-ons -> Secrets toggle does not. `allow_missing_secrets` is the escape hatch for
+    # a fork that has never run `secrets`, where the probe failing really does mean absent.
     secrets_ref = f"{kaggle_username()}/{SECRETS_DATASET}"
-    sources = [secrets_ref] if dataset_exists(secrets_ref) else []
+    try:
+        sources = [secrets_ref] if dataset_exists(secrets_ref) else []
+    except SecretsUnverified:
+        if not allow_missing_secrets:
+            raise
+        sources = []
     return {
         "id": f"{kaggle_username()}/{slug}",
         "title": slug,
@@ -192,17 +223,20 @@ def with_overrides(source: str, overrides: dict[str, str]) -> str:
     return "".join(lines[:end]) + "\n" + injected + "".join(lines[end:])
 
 
-def stage(slug: str, private: bool, overrides: dict[str, str]) -> Path:
+def stage(slug: str, private: bool, overrides: dict[str, str], meta: dict | None = None) -> Path:
     """Build the upload folder: the entry script and nothing else.
 
     Only the entry point is uploaded. It clones the repository at a branch, so the code that
     runs is the code in git rather than a copy that drifted, and the kernel diff stays
     readable.
+
+    `meta` is passed in by `push`, which needs to look at it before deciding to upload at
+    all; building it here as well would probe the secrets dataset a second time.
     """
     folder = Path(tempfile.mkdtemp(prefix="kabr-kernel-"))
     (folder / ENTRY.name).write_text(with_overrides(ENTRY.read_text(), overrides))
     (folder / "kernel-metadata.json").write_text(
-        json.dumps(metadata(slug, private), indent=2) + "\n")
+        json.dumps(meta if meta is not None else metadata(slug, private), indent=2) + "\n")
     return folder
 
 
@@ -231,9 +265,21 @@ def push(ns, overrides: dict[str, str], quiet: bool = False) -> str | None:
     rather than the process's own opinion of whether it worked.
     """
     ref = f"{kaggle_username()}/{ns.slug}"
-    folder = stage(ns.slug, not ns.public, overrides)
+    # Before uploading, not after: a kernel pushed without the token dataset attached is a
+    # chunk that trains nothing and stops at minute one, and by then the session slot is
+    # spent. Refusing to push is the cheaper half of that trade.
+    try:
+        meta = metadata(ns.slug, not ns.public,
+                        allow_missing_secrets=getattr(ns, "allow_missing_secrets", False))
+    except SecretsUnverified as exc:
+        return (f"{exc}. Not pushing: a chunk with no HF_TOKEN stops at minute one and "
+                f"spends a session slot to do it. Pass --allow-missing-secrets to override.")
+    folder = stage(ns.slug, not ns.public, overrides, meta)
     if not quiet:
         print(f"staged {folder}" + (f" with {overrides}" if overrides else ""))
+        if not meta["dataset_sources"]:
+            print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
+            print(f"  fix it with: python {Path(__file__).name} secrets")
     code, text = kaggle("kernels", "push", "-p", str(folder),
                         "--accelerator", ns.accelerator, "-t", str(ns.timeout))
     shutil.rmtree(folder, ignore_errors=True)
@@ -244,9 +290,6 @@ def push(ns, overrides: dict[str, str], quiet: bool = False) -> str | None:
     if not quiet:
         print(f"\npushed {ref}")
         print(f"  https://www.kaggle.com/code/{ref}")
-        if not metadata(ns.slug, not ns.public)["dataset_sources"]:
-            print(f"  no {SECRETS_DATASET} dataset: this chunk cannot save what it earns.")
-            print(f"  fix it with: python {Path(__file__).name} secrets")
         print(f"  watch it with: python {Path(__file__).name} status --slug {ns.slug}")
     return None
 
@@ -276,6 +319,31 @@ RECONFIRM_SECONDS = 90
 # week turns over. Coarser than the training poll interval because there is nothing to
 # learn by asking again in five minutes.
 QUOTA_RETRY_SECONDS = 1800
+# Quota is not the only rejection that passes on its own. Measured 08-03: the OAuth access
+# token reached its expiry mid-run and for thirty minutes every Kaggle call - `kernels
+# status`, `datasets files` - came back "Permission ... denied", until the CLI refreshed the
+# token by itself and the same commands worked again untouched. Treating that as fatal ends
+# the run overnight over something that repaired itself before anyone could have looked. It
+# is still bounded, because a revoked credential looks the same on any single reading and
+# should not be retried forever.
+TRANSIENT_RETRY_SECONDS = 900
+TRANSIENT_PUSH_ATTEMPTS = 3
+
+
+def push_failure_kind(failure: str) -> str:
+    """`quota`, `transient` or `fatal` - how much patience a rejected push has earned.
+
+    Text matching, because these arrive as prose on an exit code of 0 and there is no
+    structured field to read. Deliberately generous about what counts as transient: the cost
+    of waiting out a fatal error is `TRANSIENT_PUSH_ATTEMPTS` delays before stopping anyway,
+    while the cost of giving up on a transient one is the rest of the night.
+    """
+    low = failure.lower()
+    if "quota" in low:
+        return "quota"
+    transient = ("could not confirm", "denied", "403", "forbidden", "401", "unauthorized",
+                 "expired", "timed out", "timeout", "connection", "temporarily")
+    return "transient" if any(s in low for s in transient) else "fatal"
 
 
 def kernel_status(ref: str) -> tuple[str, str]:
@@ -310,15 +378,17 @@ def watch(ns, overrides: dict[str, str]) -> None:
       loop's own push (`SETTLE_SECONDS`), and separately - measured once - just wrong:
       COMPLETE for four minutes while the kernel kept training. A second read after a short
       pause is what catches both.
-    - Give up on a quota rejection. It is not a failure that a resubmit fixes today, but it
-      is not a failure at all next week, so this backs off and keeps trying rather than
-      needing a person to notice and restart it once the quota turns over. A rejection for
-      any other reason - auth, a malformed kernel - does stop the loop, because retrying
-      that one is pure waste.
+    - Give up on a rejection that passes by itself. Weekly quota is one, and is retried
+      indefinitely because it is not a failure at all next week. An expired credential is
+      the other - measured, a token that lapsed mid-run made every Kaggle call fail for
+      thirty minutes and then start working again untouched - and is retried
+      `TRANSIENT_PUSH_ATTEMPTS` times before stopping, because a revoked one reads the same
+      on any single attempt. A rejection that looks like neither - a malformed kernel - still
+      stops the loop immediately.
 
     `--chunks` still caps how many chunks it will actually launch, so the worst case if
-    something upstream starts failing in a way that looks like success stays bounded. Quota
-    backoffs do not count against the cap, since they launch nothing.
+    something upstream starts failing in a way that looks like success stays bounded. Neither
+    kind of backoff counts against the cap, since they launch nothing.
 
     A chunk killed mid-flight is still resubmitted, because the trainer pushes to the hub
     every 2000 steps: the next chunk restarts from the last of those, not from zero.
@@ -333,6 +403,9 @@ def watch(ns, overrides: dict[str, str]) -> None:
     # exempt from the young-death check for that reason: at worst that costs one resubmit,
     # which the check then catches on the round after.
     started, launched, seen_waiting = None, 0, False
+    # Consecutive push rejections that looked like a credential problem. Reset by any push
+    # that goes through, so a lapse today and another next week are not added together.
+    transient = 0
     # A loop that prints nothing until something happens is indistinguishable from a loop
     # that died, and this one is meant to be left alone overnight. Say the state on the
     # first poll, whenever it changes, and hourly regardless, so `tail` answers "is it
@@ -385,15 +458,29 @@ def watch(ns, overrides: dict[str, str]) -> None:
 
         log(f"pushing chunk {launched + 1}/{ns.chunks}")
         failure = push(ns, overrides, quiet=True)
-        if failure and "quota" in failure.lower():
+        kind = push_failure_kind(failure) if failure else None
+        if kind == "quota":
             log(f"  {failure}")
             log(f"  weekly quota, not a bug - retrying in {QUOTA_RETRY_SECONDS // 60} min "
                 f"rather than giving up on the run")
             time.sleep(QUOTA_RETRY_SECONDS)
             continue
+        if kind == "transient":
+            transient += 1
+            log(f"  {failure}")
+            if transient > TRANSIENT_PUSH_ATTEMPTS:
+                log(f"  that is {transient} in a row, so it is not a credential refreshing "
+                    f"itself. Stopping.")
+                return
+            log(f"  looks like a credential or the API being briefly unreadable "
+                f"({transient}/{TRANSIENT_PUSH_ATTEMPTS}) - retrying in "
+                f"{TRANSIENT_RETRY_SECONDS // 60} min")
+            time.sleep(TRANSIENT_RETRY_SECONDS)
+            continue
         if failure:
             log(f"  push rejected, stopping so it does not spin: {failure}")
             return
+        transient = 0
         started, launched, seen_waiting = time.time(), launched + 1, False
         log(f"  pushed, https://www.kaggle.com/code/{ref}")
         time.sleep(ns.interval)
@@ -417,6 +504,10 @@ def main() -> None:
                     help="watch: seconds between status polls")
     ap.add_argument("--min-minutes", type=int, default=45,
                     help="watch: a failed chunk shorter than this stops the loop")
+    ap.add_argument("--allow-missing-secrets", action="store_true",
+                    help="push even when the secrets dataset cannot be confirmed. For a fork "
+                         "that has never run `secrets`; a chunk pushed this way cannot save "
+                         "a checkpoint unless it gets HF_TOKEN some other way")
     ns = ap.parse_args()
 
     overrides = {}
@@ -430,7 +521,7 @@ def main() -> None:
     if ns.action == "secrets":
         return push_secrets()
     if ns.action == "metadata":
-        print(json.dumps(metadata(ns.slug, not ns.public), indent=2))
+        print(json.dumps(metadata(ns.slug, not ns.public, ns.allow_missing_secrets), indent=2))
         return
     if ns.action == "status":
         raise SystemExit(kaggle("kernels", "status", ref)[0])

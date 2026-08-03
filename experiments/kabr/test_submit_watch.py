@@ -89,7 +89,11 @@ def test_push_trusts_kaggles_text_over_its_exit_code(monkeypatch):
     """`kaggle kernels push` returns 0 even when Kaggle itself rejects the push - measured,
     for a weekly-quota rejection. An exit-code check alone reads that as a success."""
     monkeypatch.setattr(submit, "kaggle_username", lambda: "someone")
-    monkeypatch.setattr(submit, "stage", lambda slug, private, overrides: Path("/tmp/x"))
+    monkeypatch.setattr(submit, "metadata",
+                        lambda slug, private, allow_missing_secrets=False:
+                        {"dataset_sources": ["someone/kabr-secrets"]})
+    monkeypatch.setattr(submit, "stage",
+                        lambda slug, private, overrides, meta=None: Path("/tmp/x"))
     monkeypatch.setattr(submit, "shutil", SimpleNamespace(rmtree=lambda *a, **k: None))
     monkeypatch.setattr(submit, "kaggle", lambda *a: (
         0, "Kernel push error: Maximum weekly GPU quota of 30.00 hours reached.\n"))
@@ -97,6 +101,46 @@ def test_push_trusts_kaggles_text_over_its_exit_code(monkeypatch):
     failure = submit.push(ns, {}, quiet=True)
     assert failure and "quota" in failure.lower(), failure
     print("[ok] a rejection is read from kaggle's text, not trusted to show up as an exit code")
+
+
+def test_a_failed_probe_is_not_read_as_an_absent_dataset(monkeypatch):
+    """Kaggle answers a bare 403 both for a dataset that does not exist and for one the
+    caller is not currently allowed to read - measured, by asking for a dataset that was
+    never created and getting a reply identical to the one a lapsed token gets. Nothing
+    distinguishes them, so the probe has to refuse to answer rather than guess "absent"."""
+    monkeypatch.setattr(submit.time, "sleep", lambda s: None)
+    monkeypatch.setattr(submit.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=1, stdout="403 Client Error: Forbidden for url: ...", stderr=""))
+    try:
+        submit.dataset_exists("someone/kabr-secrets", attempts=2, pause=0)
+    except submit.SecretsUnverified as exc:
+        assert "could not confirm" in str(exc).lower(), exc
+    else:
+        raise AssertionError("a 403 must not be reported as a confident False")
+
+    monkeypatch.setattr(submit.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout="name  size\ntokens.json  121", stderr=""))
+    assert submit.dataset_exists("someone/kabr-secrets", attempts=2, pause=0) is True
+    print("[ok] an unreadable secrets dataset is 'cannot tell', not 'not there'")
+
+
+def test_push_refuses_rather_than_launching_a_chunk_that_cannot_save(monkeypatch):
+    """The expensive shape of that bug: the probe fails, the secrets dataset is silently
+    left unattached, and the kernel goes up anyway. It then trains with no HF_TOKEN, stops
+    itself at minute one, and the watch loop reads a chunk that died young and gives up for
+    the night. Not pushing at all costs a delay instead of a session."""
+    monkeypatch.setattr(submit, "kaggle_username", lambda: "someone")
+    monkeypatch.setattr(submit.time, "sleep", lambda s: None)
+    monkeypatch.setattr(submit, "dataset_exists", lambda *a, **k: (_ for _ in ()).throw(
+        submit.SecretsUnverified("could not confirm whether someone/kabr-secrets exists")))
+    pushed = []
+    monkeypatch.setattr(submit, "kaggle", lambda *a: pushed.append(a) or (0, "successfully pushed"))
+    ns = SimpleNamespace(slug="s", public=False, accelerator="NvidiaTeslaT4", timeout=43_200,
+                         allow_missing_secrets=False)
+    failure = submit.push(ns, {}, quiet=True)
+    assert failure and not pushed, (failure, pushed)
+    assert submit.push_failure_kind(failure) == "transient", failure
+    print("[ok] a push that cannot confirm its token dataset is refused, not sent anyway")
 
 
 def test_a_finished_chunk_launches_the_next(monkeypatch):
@@ -197,15 +241,46 @@ def test_an_unreadable_status_is_not_a_finished_chunk(monkeypatch):
     print("[ok] an unreadable status is retried, not treated as a finished chunk")
 
 
-def test_a_non_quota_push_failure_stops_the_loop(monkeypatch):
-    """Auth broke, or the staged kernel is malformed: retrying every five minutes for a
-    week does not fix either, so this is the case that should stop and wait for a person."""
+def test_a_push_failure_that_fixes_nothing_by_waiting_stops_the_loop(monkeypatch):
+    """A malformed kernel does not become well formed in five minutes, so this is the case
+    that should stop and wait for a person rather than spend the week rediscovering it."""
     calls, stopped = run_watch(monkeypatch, [
         ("RUNNING", 60), ("COMPLETE", 0), ("COMPLETE", 0),
-    ], chunks=4, push_failures=["403 Forbidden: token expired"])
+    ], chunks=4, push_failures=["Kernel push error: invalid metadata, code_file not found"])
     assert (len(calls), stopped) == (1, True), (calls, stopped)
-    assert calls[0][1] and "quota" not in calls[0][1].lower()
-    print("[ok] a non-quota push rejection stops the loop instead of spinning on it")
+    assert submit.push_failure_kind(calls[0][1]) == "fatal", calls[0][1]
+    print("[ok] a push rejection that waiting cannot fix stops the loop instead of spinning")
+
+
+def test_a_credential_lapse_is_waited_out_rather_than_given_up_on(monkeypatch):
+    """Measured 08-03: the OAuth access token hit its expiry mid-run and every Kaggle call
+    returned "Permission ... denied" for thirty minutes, then worked again untouched once
+    the CLI refreshed it. The chunk boundary can land inside that window, and stopping there
+    costs the night for something that repaired itself."""
+    calls, stopped = run_watch(monkeypatch, [
+        ("RUNNING", 60), ("COMPLETE", 0), ("COMPLETE", 0),   # push one: token is lapsed
+        ("COMPLETE", 0), ("COMPLETE", 0),                     # retried after the backoff
+        ("RUNNING", 60),                                      # the retry got through
+    ], chunks=1, push_failures=[
+        "Cannot access kernel 'x' (Permission 'kernels.get' was denied).", None])
+    assert len(calls) == 2, calls
+    assert submit.push_failure_kind(calls[0][1]) == "transient", calls[0][1]
+    assert calls[1][1] is None
+    assert stopped is False, "a token that is about to refresh itself must not stop the loop"
+    print("[ok] a credential lapse is retried, since the one that was measured self-healed")
+
+
+def test_a_credential_lapse_that_never_clears_still_stops(monkeypatch):
+    """The other half: a revoked token reads exactly like a lapsed one on any single
+    attempt, so the patience has to be bounded rather than infinite."""
+    fails = ["Permission 'kernels.get' was denied."] * (submit.TRANSIENT_PUSH_ATTEMPTS + 1)
+    calls, stopped = run_watch(monkeypatch, [
+        ("RUNNING", 60), ("COMPLETE", 0), ("COMPLETE", 0),
+    ] + [("COMPLETE", 0), ("COMPLETE", 0)] * (submit.TRANSIENT_PUSH_ATTEMPTS + 2),
+        chunks=1, push_failures=fails)
+    assert stopped is True, "an unreadable credential must not be retried forever"
+    assert len(calls) == submit.TRANSIENT_PUSH_ATTEMPTS + 1, calls
+    print("[ok] a credential that never comes back stops the loop after a bounded wait")
 
 
 def test_a_quota_rejection_backs_off_and_keeps_trying(monkeypatch):

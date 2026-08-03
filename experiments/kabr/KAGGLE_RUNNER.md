@@ -78,6 +78,28 @@ Note that the mount path is not stable: the same dataset appears at
 `/kaggle/input/kabr-secrets/` on one kernel and `/kaggle/input/datasets/…` on another, with
 identical metadata. The session searches by file name at any depth for that reason.
 
+**A failed probe does not mean the dataset is gone.** `metadata()` asks whether the secrets
+dataset exists before attaching it, and Kaggle answers a bare `403 Client Error: Forbidden`
+both for a dataset that was never created and for one the caller cannot currently read —
+measured, by asking for a name that definitely does not exist and getting a reply identical
+to the one a lapsed token gets for a name that does. Nothing in the response tells them
+apart, so the probe retries and then refuses to answer rather than guessing. This matters
+because guessing "absent" is silent and expensive: the kernel goes up with no secrets
+attached, trains with no `HF_TOKEN`, stops itself at minute one, and `watch` reads a chunk
+that died young and gives up for the night. `--allow-missing-secrets` is the escape hatch for
+a fork that genuinely has never run `secrets`.
+
+**Running as a collaborator.** The account that pushes does not have to be the account that
+owns the kernel; sharing the kernel and the secrets dataset with a second account is enough.
+`submit.py` derives both refs from `kaggle_username()`, which reports whoever the CLI is
+authenticated as, so the owner's name has to be supplied explicitly or the push silently
+creates a new, history-less kernel under the collaborator's name:
+
+    KAGGLE_USERNAME=<owner> python experiments/kabr/kaggle/submit.py push
+
+Resume does not depend on any of this — the checkpoint lives on the HF dataset and is found
+by run name — but the secrets mount does, since that ref is derived the same way.
+
 `HF_TOKEN` is the one that matters. Without it the cache still loads, because reading a
 public dataset needs no token, but the chunk has nowhere to put its checkpoint. The session
 checks for it in the first minute and stops rather than training for eleven hours and
@@ -139,8 +161,15 @@ fail towards spending nothing:
   instead. A quota rejection specifically is not stopped on — it is not a failure that
   resolves by retrying today, but it does resolve on its own at the weekly reset, so the loop
   backs off half an hour and tries again rather than needing a person to notice and restart
-  it. Any other rejection (auth, a malformed kernel) still stops the loop, because that one
-  does not fix itself.
+  it.
+- **Give up on a credential that is about to refresh itself.** Measured 08-03: the OAuth
+  access token reached its expiry mid-run and for thirty minutes every call — `kernels
+  status`, `datasets files` — returned `Permission '...' was denied`, then started working
+  again untouched once the CLI refreshed it. A chunk boundary landing inside that window used
+  to stop the loop for the night. Auth-shaped rejections now back off fifteen minutes and
+  retry, bounded at `TRANSIENT_PUSH_ATTEMPTS` (3) because a revoked token reads identically
+  on any single attempt. A malformed kernel — a rejection that waiting cannot fix — still
+  stops immediately.
 
 `--chunks` caps how many chunks it actually *launches* — a quota backoff does not count
 against it, since it launched nothing. State lives in `logs/watch.log`: the state on every
